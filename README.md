@@ -7,8 +7,8 @@ In this branch we propose the code to read the **RefCOCOg dataset**, a variant o
 - **images**:
   - images are in `refcocog/images`
   - each image file is named:
-    - `COCO_train2014_[image_id]_[annotation_id].jpg`
-    - Example: `COCO_train2014_000000130518_104426.jpg`
+    - `COCO_train2014_[image_id].jpg`
+    - Example: `COCO_train2014_000000130518.jpg`
   - according to the documentation online, the dataset is split as follows:
     - test set 2600 images
     - training set 21899 images
@@ -58,7 +58,9 @@ In this branch we propose the code to read the **RefCOCOg dataset**, a variant o
     - raw: A man with black glasses sitting in between two other men. (unprocessed referring expression (str))
     - sent_id: 20049 (sentence id)
     - sent: a man with black glasses sitting in between two other men (referring expression with mild processing, lower case, spell correction, etc. (str))
-  - file_name: target image file
+  - file_name: target image file. Each image file is named:
+    - `COCO_train2014_[image_id]_[annotation_id].jpg`
+    - Example: `COCO_train2014_000000130518_104426.jpg`
   - category_id
   - ann_id: annotation id
   - sent_ids: [20049, 20050] (same ids as nested sentences[...][sent_id] (list of int))
