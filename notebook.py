@@ -215,64 +215,64 @@ dataloader: DataLoader[tuple[list[PIL.Image], list[list[str]], list[Float[torch.
 # %%
 device: str = "cuda:0" if torch.cuda.is_available() else "cpu"
 
-# %%
-yolo_model = torch.hub.load("ultralytics/yolov5", "yolov5s", device=device, _verbose=False)
 
 # %%
-batch: tuple[PIL.Image, list[str], Float[torch.Tensor, "4"]]
+def metrics(
+    bbox_model: Callable[[PIL.Image, list[str]], Float[torch.Tensor, "X 4"]]
+) -> pd.DataFrame:
+    ious: list[float] = []
+    rs: list[int] = []
+
+    with torch.inference_mode():
+        img: PIL.Image
+        prompts: list[str]
+        true_xywh: Float[torch.Tensor, "4"]
+
+        for img, prompts, true_xywh in tqdm_take(dataloader):
+            true_xyxy: Float[torch.Tensor, "1 4"] = torchvision.ops.box_convert( true_xywh.unsqueeze(0), in_fmt="xywh", out_fmt="xyxy").to(device)
+            pred_xyxy: Float[torch.Tensor, "X 4"] = bbox_model(img, prompts)
+
+            iou: float = torch.max(box_iou(true_xyxy, pred_xyxy)).item()
+            r: int = pred_xyxy.shape[0]
+
+            ious.append(iou)
+            rs.append(r)
+
+    return pd.DataFrame({"iou": ious, "#": rs})
+
 
 # %%
-rs: list[int] = []
-ious: list[float] = []
-
-with torch.inference_mode():
-    Z: Float[torch.Tensor, "1 4"] = torch.zeros((1, 4)).to(device)
-
-    for img, prompts, true_xywh in tqdm_take(dataloader):
-        true_xyxy: Float[torch.Tensor, "1 4"] = torchvision.ops.box_convert(true_xywh.unsqueeze(0), in_fmt="xywh", out_fmt="xyxy").to(device)
-        pred_xyxy: Float[torch.Tensor, "X 4"] = yolo_model(img).xyxy[0][:, :4]
-
-        r: int = pred_xyxy.shape[0]
-        iou: float = torch.max(box_iou(true_xyxy, torch.cat((Z, pred_xyxy), 0))).item()
-
-        rs.append(r)
-        ious.append(iou)
-
-# %%
-torch.mean(torch.tensor(ious, dtype=torch.float))
-
-# %%
-torch.mean(torch.tensor(rs, dtype=torch.float))
+yolo_v5_model = torch.hub.load("ultralytics/yolov5", "yolov5s", device=device, _verbose=False)
 
 # %%
 yolo_v8_model: YOLO = YOLO("yolov8s.pt")
 
 # %%
-rs: list[int] = []
-ious: list[float] = []
-
-with torch.inference_mode():
-    Z: Float[torch.Tensor, "1 4"] = torch.zeros((1, 4)).to(device)
-
-    for img, prompts, true_xywh in tqdm_take(dataloader):
-        true_xyxy: Float[torch.Tensor, "1 4"] = torchvision.ops.box_convert(true_xywh.unsqueeze(0), in_fmt="xywh", out_fmt="xyxy").to(device)
-        pred_xyxy = torch.cat(
-            [Z] + [
-                box.xyxy
-                for pred in yolo_v8_model.predict(img, verbose=False)
-                for box in pred.boxes
-            ],
-            0,
-        )
-
-        r: int = pred_xyxy.shape[0]
-        iou: float = torch.max(box_iou(true_xyxy, torch.cat((Z, pred_xyxy), 0))).item()
-
-        rs.append(r)
-        ious.append(iou)
+Z: Float[torch.Tensor, "1 4"] = torch.zeros(1, 4).to(device)
 
 # %%
-torch.mean(torch.tensor(ious, dtype=torch.float))
+yolo_v5_metrics: pd.DataFrame = metrics(
+    lambda img, _: torch.cat(
+        [Z] + [
+            box[:, :4]
+            for box in yolo_v5_model(img).xyxy
+        ],
+        0
+    )
+)
+
+yolo_v5_metrics.describe()
 
 # %%
-torch.mean(torch.tensor(rs, dtype=torch.float))
+yolo_v8_metrics: pd.DataFrame = metrics(
+    lambda img, _: torch.cat(
+        [Z] + [
+            box.xyxy
+            for pred in yolo_v8_model.predict(img, verbose=False)
+            for box in pred.boxes
+        ],
+        0,
+    )
+)
+
+yolo_v8_metrics.describe()
