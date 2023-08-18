@@ -18,11 +18,11 @@ torch
 torchvision
 torchinfo
 tqdm
+ultralytics
 END
 
 pip install -q -r requirements.txt
 pip install -q git+https://github.com/openai/CLIP.git
-pip install -q ultralytics
 
 # %%
 import clip
@@ -47,7 +47,7 @@ from torchvision import transforms
 from torchvision.utils import draw_bounding_boxes
 from torchvision.io import read_image
 from torchinfo import summary
-from typing import Literal, Callable, Mapping, TypeVar
+from typing import Literal, Callable, Mapping, TypeVar, Any, Optional
 from tqdm import tqdm
 from timeit import default_timer as timer
 from torch.utils.tensorboard import SummaryWriter
@@ -172,21 +172,14 @@ class Ref:
     sent_ids: list[int]  # same ids as nested sentences[...][sent_id]
     ref_id: int  # unique id for refering expression
 
+
 # %%
-# @dataclass
-# class Prediction:
-#  image
-#  description: list[str]  # natural language descriptions of the area of interest
-#  ground_truth_bbox: tuple[float, float, float, float] # ground truth bounding box
-#  output_bbox: tuple[float, float, float, float] # predicted bounding box
-
-
+@dataclass
 class Prediction:
-    def __init__(self, image, description, ground_truth_bbox, output_bbox):
-        self.image = image
-        self.description = description
-        self.ground_truth_bbox = ground_truth_bbox
-        self.output_bbox = output_bbox
+    image: Any
+    description: list[str]  # natural language descriptions of the area of interest
+    ground_truth_bbox: tuple[float, float, float, float]  # ground truth bounding box
+    output_bbox: tuple[float, float, float, float]  # predicted bounding box
 
 
 # %% [markdown]
@@ -228,50 +221,33 @@ id2annotation: Mapping[int, Annotation] = {x.id: x for x in instances.annotation
 # Define custom dataset
 
 # %%
-class CocoDataset(Dataset[tuple[I, P, B]]):
+class CocoDataset(Dataset[tuple[PIL.Image, list[str], Float[torch.Tensor, "4"]]]):
     def __init__(
         self,
         split: Split,
-        img_transform: Callable[[Img], I] = lambda x: x,
-        prompt_transform: Callable[[list[Sentence]], P] = lambda ps: [
-            p.sent for p in ps
-        ],
-        bb_transform: Callable[[Float[torch.Tensor, "4"]], B] = lambda x: x,
+        limit: int = -1,
     ):
-        """
-        :param split: train, test or val
-        :param img_transform: apply transformation on the processed images
-        :param prompt_transform: apply transformation on the prompts
-        :param bb_transform: apply transformation on the bounding box
-        """
-        self.img_transform = img_transform
-        self.prompt_transform = prompt_transform
-        self.bb_transform = bb_transform
-
-        # Internally the dataset is a list of tuple[str, list[Sentence], UInt[torch.Tensor, '4']]
-        # Such that:
-        # str                     : image filename
-        # list[Sentence]          : list of reference expression objects
-        # UInt[torch.Tensor, '4'] : bounding box
-        self.items: list[tuple[str, list[Sentence], Float[torch.Tensor, "4"]]] = [
-            (i, ps, o)
+        self.__init__
+        self.items: list[tuple[str, list[str], Float[torch.Tensor, "4"]]] = [
+            (i, [s.sent for s in ss], b)
             for ref in refs
             if ref.split == split
             for i in [os.path.join(data_images, ref.file_name)]
-            for ps in [ref.sentences]
-            for o in [torch.tensor(id2annotation[ref.ann_id].bbox, dtype=torch.float)]
+            for ss in [ref.sentences]
+            for b in [torch.tensor(id2annotation[ref.ann_id].bbox, dtype=torch.float)]
         ]
+        self.len: int = len(self.items) if limit < 0 else min(limit, len(self.items))
 
     def __len__(self) -> int:
-        return len(self.items)
+        return self.len
 
-    def __getitem__(self, item: int) -> tuple[I, P, B]:
-        i, ps, b = self.items[item]
-        return (
-            self.img_transform(read_image(i)),
-            self.prompt_transform(ps),
-            self.bb_transform(b),
-        )
+    def __getitem__(
+        self, index: int
+    ) -> tuple[PIL.Image, list[str], Float[torch.Tensor, "4"]]:
+        i, ps, b = self.items[index]
+        with PIL.Image.open(i) as img:
+            img.load()
+            return img, ps, b
 
 
 # %% [markdown]
@@ -282,37 +258,37 @@ class CocoDataset(Dataset[tuple[I, P, B]]):
 # Load yolo model
 
 # %%
-yolo_model = torch.hub.load("ultralytics/yolov5", "yolov5s", pretrained=True)
-yolo_model.to(device=device).eval()
+yolo_model = torch.hub.load("ultralytics/yolov5", "yolov5s", pretrained=True, device=device)
 
 # %% [markdown]
 # Load CLIP model
 
 # %%
-clip_model, preprocess = clip.load("RN50")
-clip_model = clip_model.to(device=device).eval()
+clip_model, preprocess = clip.load("RN50", device=device)
 
 # %% [markdown]
 # Baseline evaluation
 
 # %%
-test_dataset: Dataset[tuple[Img, list[str], UInt[torch.Tensor, "4"]]] = CocoDataset(
-    split="test"
+test_dataset: Dataset[tuple[PIL.Image, list[str], Float[torch.Tensor, "4"]]] = CocoDataset(
+    split="test",
+    limit=10
 )
 
 # %%
-BATCH_SIZE = 1
-NUM_WORKERS = os.cpu_count()
-print(f"Creating DataLoader's with batch size {BATCH_SIZE} and {NUM_WORKERS} workers.")
+BATCH_SIZE: Optional[int] = None
+NUM_WORKERS: int = os.cpu_count()
+
+print(f"Creating DataLoader w/ batch size {BATCH_SIZE} and {NUM_WORKERS} workers.")
 
 test_dataloader = DataLoader(
-    dataset=test_dataset, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, shuffle=False
+    dataset=test_dataset,
+    batch_size=BATCH_SIZE,
+    num_workers=NUM_WORKERS,
+    shuffle=False,
 )
 
 # %%
-MAX_ITER: int = 10  # max number of iterations
-current_iteration: int = 0
-
 stored_predictions: list[Prediction] = []
 
 ious: list[float] = []
@@ -324,17 +300,10 @@ batch: tuple[
 ]
 
 with torch.no_grad():
-    for batch in tqdm(
-        it.islice(iter(test_dataloader), min(MAX_ITER, len(test_dataloader))),
-        total=min(MAX_ITER, len(test_dataloader)),
-    ):
-        [img], (prompts), [true_xywh] = batch
-
+    for img_pil, prompts, true_xywh in tqdm(test_dataloader):
         [true_xyxy] = torchvision.ops.box_convert(
             true_xywh.unsqueeze(0), in_fmt="xywh", out_fmt="xyxy"
         )
-
-        img_pil: Image = transforms.ToPILImage()(img)
 
         # yolo bboxes
         predictions = yolo_model(img_pil)
@@ -346,7 +315,7 @@ with torch.no_grad():
         # if empty, put a bbox equal to image size
         if len(bboxes) == 0:
             bboxes = torch.tensor(
-                [[0, 0, img.size()[1], img.size()[2], 0, 0]], dtype=torch.float
+                [[0, 0, img_pil.size[0], img_pil.size[1], 0, 0]], dtype=torch.float
             )
 
         # from yolo bboxes to cropped images
@@ -366,7 +335,7 @@ with torch.no_grad():
             [
                 template.format(prompt)
                 for template in ["{}", "A photo of {}", "We can see {}"]
-                for (prompt,) in prompts  # <- ¯\_(ツ)_/¯
+                for prompt in prompts
             ]
         )
 
@@ -387,12 +356,12 @@ with torch.no_grad():
         ious.append(iou)
 
         rectangle: tuple[int, int, int, int] = true_xyxy.tolist()
-        ground_truth_crop = img_pil.crop(rectangle)
+        ground_truth_crop: PIL.Image = img_pil.crop(rectangle)
 
         rectangle: tuple[int, int, int, int] = torch.tensor(
             prediction_bbox, dtype=torch.int
         ).tolist()
-        prediction_crop = img_pil.crop(rectangle)
+        prediction_crop: PIL.Image = img_pil.crop(rectangle)
 
         # from float16 to float32
         X: Float[torch.Tensor, "1"] = torch.tensor(
@@ -416,10 +385,10 @@ with torch.no_grad():
 
         # store the prediction
         pred: Prediction = Prediction(
-            image=img,
-            description=[p[0] for p in prompts],
-            ground_truth_bbox=true_xyxy,
-            output_bbox=prediction_bbox,
+            image=img_pil,
+            description=prompts,
+            ground_truth_bbox=true_xyxy.tolist(),
+            output_bbox=prediction_bbox.tolist(),
         )
         stored_predictions.append(pred)
 
@@ -450,31 +419,18 @@ print(f"euds: {torch.mean(torch.tensor(euds, dtype=torch.float))}")
 # args:
 #  - predictionList: [Prediction]
 #  - numPred: int :: if numPred==-1 (default) consider all the predictions in predictionList
-def display_predictions(predictionList, numPred=-1):
-    limit = 0
-    for p in predictionList:
-        if numPred != -1 and limit >= numPred:
-            return
-        limit += 1
+def display_predictions(predictionList: list[Prediction], numPred: int = -1):
+    limit: int = len(predictionList) if numPred < 0 else min(numPred, len(predictionList))
+    p: Prediction
 
-        p_image = p.image
-        p_description = p.description
-        p_ground_truth_bbox = p.ground_truth_bbox
-        p_output_bbox = p.output_bbox
+    for p in predictionList[:limit]:
+        img: PIL.Image = p.image.copy()
+        img_d: PIL.ImageDraw = PIL.ImageDraw.Draw(img)
+        img_d.rectangle(p.ground_truth_bbox, outline="green", width=5)
+        img_d.rectangle(p.output_bbox, outline="red", width=5)
 
-        # TODO: concatenate
-        p_image = draw_bounding_boxes(
-            p_image, p_ground_truth_bbox.unsqueeze(0), colors="green", width=5
-        )
-        p_image = draw_bounding_boxes(
-            p_image, p_output_bbox.unsqueeze(0), colors="red", width=5
-        )
-
-        tensor_to_pil = transforms.ToPILImage()
-        image_pil = tensor_to_pil(p_image)
-        display(image_pil)
-        print(p_description)
-        print("\n\n")
+        display(img)
+        print(p.description, "\n\n")
 
 
 # %%
@@ -493,16 +449,11 @@ class Yolo_v5(torch.nn.Module):
         super().__init__()
 
         # load yolo model
-        yolo_model = torch.hub.load("ultralytics/yolov5", "yolov5s", pretrained=True)
-        yolo_model.to(device=device).eval()
+        yolo_model = torch.hub.load("ultralytics/yolov5", "yolov5s", device=device, pretrained=True)
 
     def forward(
-        self, img: torch.Tensor
-    ) -> torch.Tensor:  # TODO: img non credo che sia di tipo torch.Tensor
-        # convert image tensor to image PIL
-        pil_transormation = transforms.ToPILImage()
-        img_pil = [pil_transormation(_img) for _img in img]
-
+        self, img_pil: list[PIL.Image]
+    ) -> list[Float[torch.Tensor, "X 6"]]:
         #######print(f"img_pil 0: {type(img_pil)}")
         #######print(f"img_pil 1: {len(img_pil)}")
         #######print("img_pil[0]")
@@ -659,9 +610,9 @@ summary(
 class CLIP_SF(torch.nn.Module):
     def __init__(
         self,
-        visual_encoder,  # visual encoder
+        visual_encoder: Callable[[Float[torch.Tensor, "X 3 244 244"]], Float[torch.Tensor, "X 1024"]],  # visual encoder
         visual_encoder_preprocess,  # visual encoder preprocessing
-        text_encoder,  # natural language prompts encoder
+        text_encoder: Callable[[Float[torch.Tensor, "P 77"]], Float[torch.Tensor, "P 1024"]],  # natural language prompts encoder
         text_encoder_preprocess,  # text encoder preprocessing
         freeze_visual_encoder: bool = False,  # TRUE -> visual encoder parameters are not trained
         freeze_text_encoder: bool = False,  # TRUE -> text encoder parameters are not trained
@@ -688,7 +639,7 @@ class CLIP_SF(torch.nn.Module):
     """
 
     # preprocess input prompts as required by the visual encoder
-    def visual_preprocess(self, input_crops):
+    def visual_preprocess(self, input_crops: list[PIL.Image]) -> Float[torch.Tensor, "X 3 244 244"]:
         output_crops: Float[torch.Tensor, "X 3 244 244"] = torch.stack(
             [self.visual_encoder_preprocess(crop) for crop in input_crops]
         ).to(device=device)
@@ -696,16 +647,16 @@ class CLIP_SF(torch.nn.Module):
         return output_crops
 
     # preprocess text prompts as required by the text encoder
-    def text_preprocess(self, input_prompts):
+    def text_preprocess(self, input_prompts: list[str]) -> Int[torch.Tensor, "P 77"]:
         ##########print("input_prompts")
         ##########print(input_prompts)
         output_prompts: Int[torch.Tensor, "P 77"] = self.text_encoder_preprocess(
-            [prompt for prompt in input_prompts]
+            input_prompts
         )
 
         return output_prompts
 
-    def cosine_similarity(self, images_z: torch.Tensor, texts_z: torch.Tensor):
+    def cosine_similarity(self, images_z: Float[torch.Tensor, "X 4"], texts_z: Float[torch.Tensor, "1 4"]) -> Float[torch.Tensor, "X"]:
         # normalise the image and the text
         images_z = images_z / images_z.norm(dim=-1, keepdim=True)
         texts_z = texts_z / texts_z.norm(dim=-1, keepdim=True)
@@ -715,33 +666,27 @@ class CLIP_SF(torch.nn.Module):
 
         return similarity.cpu()
 
-    def forward(self, x):
+    def forward(self, x: list[tuple[list[PIL.Image], list[str]]]) -> list[Float[torch.Tensor, "dunno"]]:
         # x :: [([crop11, crop12, ..., crop1M], [prompt_11, ..., prompt_1N]), ([crop21, crop22, ..., crop2P], [prompt_21, ..., prompt_2K])]
 
-        y = list()
+        y: list[Float[torch.Tensor, "dunno"]] = list()
 
-        for input_x in x:
+        input_x_crop_list: list[PIL.Image]
+        input_x_prompt_list: list[str]
+
+        for input_x_crop_list, input_x_prompt_list in x:
             # input_x :: ([crop11, crop12, ..., crop1M], [prompt_11, ..., prompt_1N])
-
-            prediction_bbox_index = -1
-
-            input_x_crop_list = input_x[0]
-            input_x_prompt_list = input_x[1]
 
             ##########print(len(input_x_crop_list))
             ##########print(input_x_prompt_list)
 
             # step 1: preprocess crops as required by the visual encoder
             with torch.no_grad():
-                input_x_crop_list_preprocessed = self.visual_preprocess(
-                    input_x_crop_list
-                )
+                input_x_crop_list_preprocessed: Float[torch.Tensor, "X 3 244 244"] = self.visual_preprocess(input_x_crop_list)
 
             # step 2: preprocess prompts as required by the text encoder
             with torch.no_grad():
-                input_x_prompt_list_preprocessed = self.text_preprocess(
-                    input_x_prompt_list
-                )
+                input_x_prompt_list_preprocessed: Int[torch.Tensor, "P 77"] = self.text_preprocess(input_x_prompt_list)
 
             ##########print("input_x_crop_list_preprocessed.shape")
             ##########print(input_x_crop_list_preprocessed.shape)
@@ -751,9 +696,9 @@ class CLIP_SF(torch.nn.Module):
             # step 3: compute crop representation in the latent space
             if self.freeze_visual_encoder:
                 with torch.no_grad():
-                    crop_list_z = self.visual_encoder(input_x_crop_list_preprocessed)
+                    crop_list_z: Float[torch.Tensor, "X 1024"] = self.visual_encoder(input_x_crop_list_preprocessed)
             else:
-                crop_list_z = self.visual_encoder(input_x_crop_list_preprocessed)
+                crop_list_z: Float[torch.Tensor, "X 1024"] = self.visual_encoder(input_x_crop_list_preprocessed)
 
             ##########print()
             ##########print("crop_list_z")
@@ -763,9 +708,9 @@ class CLIP_SF(torch.nn.Module):
             # step 4: compute prompt representation in the latent space
             if self.freeze_text_encoder:
                 with torch.no_grad():
-                    prompt_list_z = self.text_encoder(input_x_prompt_list_preprocessed)
+                    prompt_list_z: Float[torch.Tensor, "P 1024"] = self.text_encoder(input_x_prompt_list_preprocessed)
             else:
-                prompt_list_z = self.text_encoder(input_x_prompt_list_preprocessed)
+                prompt_list_z: Float[torch.Tensor, "P 1024"] = self.text_encoder(input_x_prompt_list_preprocessed)
 
             ##########print()
             ##########print("prompt_list_z")
@@ -773,7 +718,7 @@ class CLIP_SF(torch.nn.Module):
             ##########print(prompt_list_z.shape)
 
             # step 5: evaluate logits
-            similarity_matrix = self.cosine_similarity(
+            similarity_matrix: Float[torch.Tensor, "X P"] = self.cosine_similarity(
                 prompt_list_z, crop_list_z
             )  # todo: valutare se usare torch.nn.functional.cosine_similarity
 
@@ -782,7 +727,7 @@ class CLIP_SF(torch.nn.Module):
             ##########print()
 
             # step 6: get prediction
-            mean_similarity_bbox = torch.mean(similarity_matrix, dim=1)
+            mean_similarity_bbox: Float[torch.Tensor, "X"] = torch.mean(similarity_matrix, dim=1)
 
             ##########print("mean_similarity_bbox")
             ##########print(mean_similarity_bbox)
@@ -918,7 +863,6 @@ def training_step(
     loss_fn: torch.nn.Module,  # todo: in our case it is not correct nn.Module, test data type
     optimizer: torch.optim.Optimizer,  # optimizer
     accuracy_fn,  # accuracy function
-    max_sample: int = -1,  # useful during the experiments to set an upper bound on the number of samples to be evaluated (-1 :: no limit)
     device: torch.device = device,  # target device
 ):
     train_loss = 0.0
@@ -929,13 +873,7 @@ def training_step(
     model.to(device)
     model.train()
 
-    num_iteration: int = 0  # keep track of the number of iterations
-    for batch_idx, (img, prompts, true_xywh) in tqdm(
-        it.islice(
-            enumerate(data_loader),
-            (len(data_loader) if max_sample == -1 else max_sample),
-        )
-    ):
+    for batch_idx, (img, prompts, true_xywh) in enumerate(tqdm(data_loader)):
         """
         print()
         print(f"batch_idx: {batch_idx}")
@@ -945,16 +883,7 @@ def training_step(
         print(f"true_xywh: {true_xywh}")
         """
 
-        # check number of iteration
-        if max_sample != -1 and num_iteration >= max_sample:
-            print("\nSTOP TRAINING LOOP FOR MAX ITERATION PARAMETER")
-            break
-        num_iteration += 1
-
         # send data to target device
-        for _img in img:
-            _img = _img.to(device)
-
         # convert bbox to the proper format
         true_xywh = torch.stack((true_xywh)).to(device)
 
@@ -983,8 +912,7 @@ def training_step(
 
             # from yolo bboxes to cropped images
             crops = []
-            for batch_image, batch_image_bboxes in zip(img, bboxes):
-                batch_image_pil: Image = transforms.ToPILImage()(batch_image)
+            for batch_image_pil, batch_image_bboxes in zip(img, bboxes):
 
                 list_bboxes_image: list[Image] = [
                     batch_image_pil.crop((xmin, ymin, xmax, ymax))
@@ -1049,8 +977,8 @@ def training_step(
 
     ##########print("num_iteration = "+str(num_iteration))
     # Calculate loss and accuracy per epoch and print out what's happening
-    train_loss /= num_iteration
-    iou_train_acc /= num_iteration
+    train_loss /= (batch_idx + 1)
+    iou_train_acc /= (batch_idx + 1)
     print(f"Train loss: {train_loss:.5f} | IoU train accuracy: {iou_train_acc}")
     return train_loss, iou_train_acc
 
@@ -1063,7 +991,6 @@ def test_step(
     loss_fn: torch.nn.Module,
     accuracy_fn,
     device: torch.device = device,
-    max_sample=5,
 ):
     test_loss, iou_test_acc = 0, 0
     model.to(device)
@@ -1071,22 +998,7 @@ def test_step(
 
     # Turn on inference context manager
     with torch.inference_mode():
-        num_iteration: int = 0  # keep track of the number of iterations
-        for batch_idx, (img, prompts, true_xywh) in tqdm(
-            it.islice(
-                enumerate(data_loader),
-                (len(data_loader) if max_sample == -1 else max_sample),
-            )
-        ):
-            # check number of iteration
-            if max_sample != -1 and num_iteration >= max_sample:
-                print("\n STOP TEST LOOP FOR MAX ITERATION PARAMETER")
-                break
-            num_iteration += 1
-
-            # send data to target device
-            for _img in img:
-                _img = _img.to(device)
+        for batch_idx, (img, prompts, true_xywh) in enumerate(tqdm(data_loader)):
 
             # get ground truth bbox tensor
             true_xywh = torch.stack((true_xywh)).to(device)
@@ -1105,8 +1017,7 @@ def test_step(
 
             # from yolo bboxes to cropped images
             crops = []
-            for batch_image, batch_image_bboxes in zip(img, bboxes):
-                batch_image_pil: Image = transforms.ToPILImage()(batch_image)
+            for batch_image_pil, batch_image_bboxes in zip(img, bboxes):
 
                 list_bboxes_image: list[Image] = [
                     batch_image_pil.crop((xmin, ymin, xmax, ymax))
@@ -1149,8 +1060,8 @@ def test_step(
             ##########print(acc)
 
         # Adjust metrics and print out
-        test_loss /= num_iteration
-        iou_test_acc /= num_iteration
+        test_loss /= (batch_idx + 1)
+        iou_test_acc /= (batch_idx + 1)
         print(f"Test loss: {test_loss:.5f} | IoU test accuracy: {iou_test_acc:.5f}\n")
         return test_loss, iou_test_acc
 
@@ -1215,24 +1126,25 @@ train_time_start = (
 # create a logger for the experiment
 writer = SummaryWriter(log_dir="runs/exp1")
 
+# get dataloaders
+BATCH_SIZE = 2
+NUM_WORKERS = os.cpu_count()  # TODO: non va con questo
+# NUM_WORKERS = 1
+
 # get dataset instance
 train_dataset: Dataset[tuple[Img, list[str], UInt[torch.Tensor, "4"]]] = CocoDataset(
-    split="train"
+    split="train", limit=BATCH_SIZE * 5
 )
 test_dataset: Dataset[tuple[Img, list[str], UInt[torch.Tensor, "4"]]] = CocoDataset(
-    split="test"
+    split="test", limit=BATCH_SIZE * 5
 )
 val_dataset: Dataset[tuple[Img, list[str], UInt[torch.Tensor, "4"]]] = CocoDataset(
-    split="val"
+    split="val", limit=BATCH_SIZE * 5
 )
 print(
     f"LEN_TRAIN_DATASET: {len(train_dataset)}, LEN_TEST_DATASET: {len(test_dataset)}, LEN_VALIDATION_DATASET: {len(val_dataset)}"
 )
 
-# get dataloaders
-BATCH_SIZE = 2
-# NUM_WORKERS = os.cpu_count() # TODO: non va con questo
-NUM_WORKERS = 1
 print(f"Creating DataLoader's with batch size {BATCH_SIZE} and {NUM_WORKERS} workers.")
 train_loader = DataLoader(
     dataset=train_dataset,
@@ -1312,7 +1224,6 @@ for epoch in tqdm(range(epochs)):
         loss_fn=cost_function,
         optimizer=optimizer,
         accuracy_fn=accuracy_fn,
-        max_sample=5,
     )
 
     val_loss, val_accuracy = test_step(
@@ -1321,7 +1232,6 @@ for epoch in tqdm(range(epochs)):
         data_loader=val_loader,
         loss_fn=cost_function,
         accuracy_fn=accuracy_fn,
-        max_sample=5,
     )
 
     # logs to TensorBoard
@@ -1353,7 +1263,6 @@ train_loss, train_accuracy = test_step(
     data_loader=train_loader,
     loss_fn=cost_function,
     accuracy_fn=accuracy_fn,
-    max_sample=5,
 )
 val_loss, val_accuracy = test_step(
     model=net,
@@ -1361,7 +1270,6 @@ val_loss, val_accuracy = test_step(
     data_loader=val_loader,
     loss_fn=cost_function,
     accuracy_fn=accuracy_fn,
-    max_sample=5,
 )
 test_loss, test_accuracy = test_step(
     model=net,
@@ -1369,7 +1277,6 @@ test_loss, test_accuracy = test_step(
     data_loader=test_loader,
     loss_fn=cost_function,
     accuracy_fn=accuracy_fn,
-    max_sample=5,
 )
 
 # log to TensorBoard
@@ -1392,14 +1299,3 @@ print("-----------------------------------------------------")
 
 # closes the logger
 writer.close()
-
-# %% [markdown]
-# ## Linear layers on top of text encoder
-
-# %% [markdown]
-# ## Linear layers on top of image encoder and on top of text encoder
-
-# %% [markdown]
-# ## Bottleneck
-
-# %%
