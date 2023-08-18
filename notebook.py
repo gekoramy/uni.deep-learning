@@ -142,11 +142,6 @@ class Ref:
 
 
 # %%
-def tqdm_take(xs: Iterable[T], n: int = 0) -> Iterable[T]:
-    return tqdm(xs) if n <= 0 else tqdm(it.islice(xs, n), total=n)
-
-
-# %%
 def fix_ref(x: Ref) -> Ref:
     x.file_name = fix_filename(x.file_name)
     return x
@@ -184,6 +179,7 @@ class CocoDataset(Dataset[tuple[PIL.Image, list[str], Float[torch.Tensor, "4"]]]
     def __init__(
         self,
         split: Split,
+        limit: int = -1,
     ):
         self.__init__
 
@@ -195,9 +191,10 @@ class CocoDataset(Dataset[tuple[PIL.Image, list[str], Float[torch.Tensor, "4"]]]
             for ss in [ref.sentences]
             for xywh in [torch.tensor(id2annotation[ref.ann_id].bbox, dtype=torch.float)]
         ]
+        self.len: int = len(self.items) if limit < 0 else min(limit, len(self.items))
 
     def __len__(self) -> int:
-        return len(self.items)
+        return self.len
 
     def __getitem__(self, index: int) -> tuple[PIL.Image, list[str], Float[torch.Tensor, "4"]]:
         i, ps, b = self.items[index]
@@ -208,7 +205,7 @@ class CocoDataset(Dataset[tuple[PIL.Image, list[str], Float[torch.Tensor, "4"]]]
 
 # %%
 dataloader: DataLoader[tuple[list[PIL.Image], list[list[str]], list[Float[torch.Tensor, "4"]]]] = DataLoader(
-    dataset=CocoDataset(split="test"),
+    dataset=CocoDataset(split="test", limit=100),
     batch_size=None,
 )
 
@@ -228,8 +225,8 @@ def metrics(
         prompts: list[str]
         true_xywh: Float[torch.Tensor, "4"]
 
-        for img, prompts, true_xywh in tqdm_take(dataloader):
-            true_xyxy: Float[torch.Tensor, "1 4"] = torchvision.ops.box_convert( true_xywh.unsqueeze(0), in_fmt="xywh", out_fmt="xyxy").to(device)
+        for img, prompts, true_xywh in tqdm(dataloader):
+            true_xyxy: Float[torch.Tensor, "1 4"] = torchvision.ops.box_convert(true_xywh.unsqueeze(0), in_fmt="xywh", out_fmt="xyxy").to(device)
             pred_xyxy: Float[torch.Tensor, "X 4"] = bbox_model(img, prompts)
 
             iou: float = torch.max(box_iou(true_xyxy, pred_xyxy)).item()
