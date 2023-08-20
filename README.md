@@ -1,3 +1,3 @@
 # uni.deep-learning
 
-finetune like you pretrain
+data augmentation
