@@ -1,275 +1,198 @@
 # %%
 # %%shell
+if ! [ -d dataset ]; then
+  mkdir dataset &&
+  gdown 1i-LHWSRp2F6--yhAi4IG3DiiCHmgE4cw &&
+  tar -xf refcocog.tar -C dataset &&
+  rm refcocog.tar
+fi
+
+# %%
+# %%shell
 tee requirements.txt << END
 jaxtyping
 matplotlib
+more-itertools
 pandas
 pydantic
 torch
 torchvision
 tqdm
-ultralytics
 END
 
 pip install -q -r requirements.txt
 
 # %%
-import json
-import logging
+import PIL.Image
+import csv
+import itertools as it
 import os
-import pickle
-import re
+import pandas as pd
 import torch
 import torchvision
-import PIL
-import itertools as it
-import pandas as pd
+import typing as t
 
-from datetime import datetime
-from jaxtyping import Float, UInt, Int
+from PIL.Image import Image
+from collections import defaultdict
+from jaxtyping import Float, UInt
 from pydantic.dataclasses import dataclass
-from torch.utils.data import DataLoader
-from torch.utils.data import Dataset
-from torchvision.io import read_image
-from torchvision.ops import box_convert, box_iou
+from torch.utils.data import DataLoader, Dataset
+from torchvision.ops import box_iou
 from tqdm import tqdm
-from typing import Literal, Callable, Mapping, TypeVar, Iterator, Iterable
-from ultralytics import YOLO
-
-# %% [markdown]
-# Download the dataset
 
 # %%
-# %%shell
-if ! [ -d dataset ]; then
-  mkdir dataset &&
-  gdown 1P8a1g76lDJ8cMIXjNDdboaRR5-HsVmUb &&
-  tar -xf refcocog.tar.gz -C dataset &&
-  rm refcocog.tar.gz
-fi
+path_root: str = os.path.join('dataset', 'refcocog', '')
+path_annotations: str = os.path.join(path_root, 'annotations', '')
+path_bboxes: str = os.path.join(path_root, 'bboxes', '')
+path_images: str = os.path.join(path_root, 'images', '')
+
+path_refs: str = os.path.join(path_annotations, 'refs.csv')
+path_sentences: str = os.path.join(path_annotations, 'sentences.csv')
+
+path_DETR: str = os.path.join(path_bboxes, 'bboxes[DETR].csv')
+path_YOLOv5: str = os.path.join(path_bboxes, 'bboxes[YOLOv5].csv')
+path_YOLOv8: str = os.path.join(path_bboxes, 'bboxes[YOLOv8].csv')
 
 # %%
-root = os.path.join("dataset", "refcocog", "")
-data_instances = os.path.join(root, "annotations", "instances.json")
-data_refs = os.path.join(root, "annotations", "refs(umd).p")
-data_images = os.path.join(root, "images", "")
-
-# %%
-I = TypeVar("I")
-P = TypeVar("P")
-B = TypeVar("B")
-T = TypeVar("T")
-
-Img = UInt[torch.Tensor, "C W H"]
-BBox = UInt[torch.Tensor, "4"]
-Split = Literal["train", "test", "val"]
-
-
-@dataclass
-class Info:
-    description: str  # This is stable 1.0 version of the 2014 MS COCO dataset.
-    url: str  # http://mscoco.org/
-    version: str  # 1.0
-    year: int  # 2014
-    contributor: str  # Microsoft COCO group
-    date_created: datetime  # 2015-01-27 09:11:52.357475
-
-
-@dataclass
-class Image:
-    license: int  # each image has an associated licence id
-    file_name: str  # file name of the image
-    coco_url: str  # example http://mscoco.org/images/131074
-    height: int
-    width: int
-    flickr_url: str  # example http://farm9.staticflickr.com/8308/7908210548_33e
-    id: int  # id of the imag
-    date_captured: datetime  # example '2013-11-21 01:03:06'
-
-
-@dataclass
-class License:
-    url: str  # example http://creativecommons.org/licenses/by-nc-sa/2.0/
-    id: int  # id of the licence
-    name: str  # example 'Attribution-NonCommercial-ShareAlike License
-
-
-@dataclass
-class Annotation:
-    # segmentation: list[list[float]]
-    area: float  # number of pixel of the described object
-    iscrowd: Literal[1, 0]  # Crowd annotations (iscrowd=1) are used to label large groups of objects (e.g. a crowd of people)
-    image_id: int  # id of the target image
-    bbox: tuple[float, float, float, float]  # bounding box coordinates [xmin, ymin, width, height]
-    category_id: int
-    id: int  # annotation id
-
-
-@dataclass
-class Category:
-    supercategory: str  # example 'vehicle'
-    id: int  # category id
-    name: str  # example 'airplane'
-
-
-@dataclass
-class Instances:
-    info: Info
-    images: list[Image]
-    licenses: list[License]
-    annotations: list[Annotation]
-    categories: list[Category]
-
-
-@dataclass
-class Sentence:
-    tokens: list[str]  # tokenized version of referring expression
-    raw: str  # unprocessed referring expression
-    sent: str  # referring expression with mild processing, lower case, spell correction, etc.
-    sent_id: int  # unique referring expression id
-
+Split = t.Literal['train', 'test', 'val']
 
 @dataclass
 class Ref:
-    image_id: int  # unique image id
-    split: Split
-    sentences: list[Sentence]
-    file_name: str  # file name of image relative to img_root
-    category_id: int  # object category label
-    ann_id: int  # id of object annotation in instance.json
-    sent_ids: list[int]  # same ids as nested sentences[...][sent_id]
     ref_id: int  # unique id for refering expression
+    file_name: str  # file name of image relative to img_root
+    split: Split
+    xmin: float
+    ymin: float
+    xmax: float
+    ymax: float
+
+
+with open(path_refs, 'r') as f:
+    raw = csv.DictReader(f)
+    refs: list[Ref] = [ Ref(**row) for row in raw ]
+
+# %%
+T = t.TypeVar('T')
+K = t.TypeVar('K')
+V = t.TypeVar('V')
+
+def groupby(
+    xs: list[T],
+    map_key: t.Callable[[T], K],
+    map_value: t.Callable[[T], V] = lambda x: x
+) -> dict[K, list[V]]:
+    return {
+        k: [ map_value(v) for v in vs ]
+        for k, vs in it.groupby(sorted(xs, key=map_key), key=map_key)
+    }
 
 
 # %%
-def fix_ref(x: Ref) -> Ref:
-    x.file_name = fix_filename(x.file_name)
-    return x
+@dataclass
+class Sentence:
+    ref_id: int  # unique id for refering expression
+    sent: str
 
 
-def fix_filename(x: str) -> str:
-    """
-    :param x: COCO_..._[image_id]_[annotation_id].jpg
-    :return:  COCO_..._[image_id].jpg
+with open(path_sentences, 'r') as f:
+    raw = csv.DictReader(f)
+    sentences: list[Sentence] = [ Sentence(**row) for row in raw ]
 
-    >>> fix_filename('COCO_..._[image_id]_0000000001.jpg')
-    'COCO_..._[image_id].jpg'
 
-    """
-    return re.sub("_\d+\.jpg$", ".jpg", x)
+id2sents: dict[int, list[str]] = groupby(sentences, lambda x: x.ref_id, lambda x: x.sent)
 
 
 # %%
-with open(data_refs, "rb") as f:
-    raw = pickle.load(f)
+@dataclass
+class BBox:
+    file_name: str  # file name of image relative to img_root
+    xmin: float
+    ymin: float
+    xmax: float
+    ymax: float
+    confidence: float
 
-refs: list[Ref] = [fix_ref(Ref(**ref)) for ref in raw]
+
+with open(path_DETR, 'r') as f:
+    raw = csv.DictReader(f)
+    bboxes: list[BBox] = [ BBox(**row) for row in raw ]
+
+img2detr: dict[str, list[BBox]] = defaultdict(list, groupby(bboxes, lambda x: x.file_name))
+
+
+with open(path_YOLOv5, 'r') as f:
+    raw = csv.DictReader(f)
+    bboxes: list[BBox] = [ BBox(**row) for row in raw ]
+
+img2yolov5: dict[str, list[BBox]] = defaultdict(list, groupby(bboxes, lambda x: x.file_name))
+
+
+with open(path_YOLOv8, 'r') as f:
+    raw = csv.DictReader(f)
+    bboxes: list[BBox] = [ BBox(**row) for row in raw ]
+
+img2yolov8: dict[str, list[BBox]] = defaultdict(list, groupby(bboxes, lambda x: x.file_name))
+
 
 # %%
-with open(data_instances, "r") as f:
-    raw = json.load(f)
+class CocoMetricsDataset(Dataset[tuple[Float[torch.Tensor, 'X 5'], Float[torch.Tensor, '1 4']]]):
 
-id2annotation: Mapping[int, Annotation] = {
-    x.id: x for x in Instances(**raw).annotations
-}
-
-
-# %%
-class CocoDataset(Dataset[tuple[PIL.Image, list[str], Float[torch.Tensor, "4"]]]):
     def __init__(
         self,
         split: Split,
+        img2bboxes: dict[str, list[BBox]],
         limit: int = -1,
     ):
         self.__init__
-
-        self.items: list[tuple[str, list[str], Float[torch.Tensor, "4"]]] = [
-            (i, [s.sent for s in ss], xywh)
+        self.items: list[tuple[Float[torch.Tensor, 'X 5'], Float[torch.Tensor, '1 4']]] = [
+            (xyxys, xyxy)
             for ref in refs
             if ref.split == split
-            for i in [os.path.join(data_images, ref.file_name)]
-            for ss in [ref.sentences]
-            for xywh in [torch.tensor(id2annotation[ref.ann_id].bbox, dtype=torch.float)]
+            for img in [os.path.join(path_images, ref.file_name)]
+            for bboxes in [img2bboxes[ref.file_name]]
+            for xyxys in [torch.tensor([ (bbox.xmin, bbox.ymin, bbox.xmax, bbox.ymax, bbox.confidence) for bbox in bboxes ], dtype=torch.float)]
+            for xyxy in [torch.tensor([(ref.xmin, ref.ymin, ref.xmax, ref.ymax)], dtype=torch.float)]
         ]
         self.len: int = len(self.items) if limit < 0 else min(limit, len(self.items))
+
 
     def __len__(self) -> int:
         return self.len
 
-    def __getitem__(self, index: int) -> tuple[PIL.Image, list[str], Float[torch.Tensor, "4"]]:
-        i, ps, b = self.items[index]
-        with PIL.Image.open(i) as img:
-            img.load()
-            return img, ps, b
+
+    def __getitem__(self, index: int) -> tuple[Float[torch.Tensor, 'X 5'], Float[torch.Tensor, '1 4']]:
+        return self.items[index]
 
 
 # %%
-dataloader: DataLoader[tuple[list[PIL.Image], list[list[str]], list[Float[torch.Tensor, "4"]]]] = DataLoader(
-    dataset=CocoDataset(split="test", limit=100),
-    batch_size=None,
+def metrics(dataset: Dataset[tuple[Float[torch.Tensor, 'X 5'], Float[torch.Tensor, '1 4']]]) -> pd.DataFrame:
+
+    dataloader: DataLoader[tuple[Float[torch.Tensor, 'X 5'], Float[torch.Tensor, '1 4']]] = DataLoader(dataset, batch_size=None)
+    Z: Float[torch.Tensor, '1 5'] = torch.zeros(1, 5)
+
+    ious: list[float] = [ torch.max(box_iou(true_xyxy, torch.cat((Z, xyxys))[:, :4])).item() for xyxys, true_xyxy in tqdm(dataloader) ]
+    rs: list[int] = [ xyxys.shape[0] for xyxys, _ in tqdm(dataloader) ]
+
+    return pd.DataFrame({'iou': ious, '#': rs})
+
+
+# %%
+splits: list[Split] = ['train', 'val', 'test']
+report: pd.DataFrame = pd.concat(
+    [
+        pd.concat(
+            [yolov5, yolov8, detr],
+            axis=1,
+            keys=['yolov5', 'yolov8', 'detr']
+        ).describe()
+        for split in splits
+        for yolov5 in [metrics(CocoMetricsDataset(split, img2yolov5))]
+        for yolov8 in [metrics(CocoMetricsDataset(split, img2yolov8))]
+        for detr in [metrics(CocoMetricsDataset(split, img2detr))]
+    ],
+    axis=1,
+    keys=splits
 )
 
 # %%
-device: str = "cuda:0" if torch.cuda.is_available() else "cpu"
-
-
-# %%
-def metrics(
-    bbox_model: Callable[[PIL.Image, list[str]], Float[torch.Tensor, "X 4"]]
-) -> pd.DataFrame:
-    ious: list[float] = []
-    rs: list[int] = []
-
-    with torch.inference_mode():
-        img: PIL.Image
-        prompts: list[str]
-        true_xywh: Float[torch.Tensor, "4"]
-
-        for img, prompts, true_xywh in tqdm(dataloader):
-            true_xyxy: Float[torch.Tensor, "1 4"] = torchvision.ops.box_convert(true_xywh.unsqueeze(0), in_fmt="xywh", out_fmt="xyxy").to(device)
-            pred_xyxy: Float[torch.Tensor, "X 4"] = bbox_model(img, prompts)
-
-            iou: float = torch.max(box_iou(true_xyxy, pred_xyxy)).item()
-            r: int = pred_xyxy.shape[0]
-
-            ious.append(iou)
-            rs.append(r)
-
-    return pd.DataFrame({"iou": ious, "#": rs})
-
-
-# %%
-yolo_v5_model = torch.hub.load("ultralytics/yolov5", "yolov5s", device=device, _verbose=False)
-
-# %%
-yolo_v8_model: YOLO = YOLO("yolov8s.pt")
-
-# %%
-Z: Float[torch.Tensor, "1 4"] = torch.zeros(1, 4).to(device)
-
-# %%
-yolo_v5_metrics: pd.DataFrame = metrics(
-    lambda img, _: torch.cat(
-        [Z] + [
-            box[:, :4]
-            for box in yolo_v5_model(img).xyxy
-        ],
-        0
-    )
-)
-
-yolo_v5_metrics.describe()
-
-# %%
-yolo_v8_metrics: pd.DataFrame = metrics(
-    lambda img, _: torch.cat(
-        [Z] + [
-            box.xyxy
-            for pred in yolo_v8_model.predict(img, verbose=False)
-            for box in pred.boxes
-        ],
-        0,
-    )
-)
-
-yolo_v8_metrics.describe()
+display(report)
