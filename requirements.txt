@@ -1,5 +1,0 @@
-jupyter == 1.0.0
-matplotlib == 3.7.1
-pre-commit == 3.2.2
-torch == 2.0.0
-torchvision == 0.15.1
