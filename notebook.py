@@ -486,16 +486,16 @@ def unzip(batch: list[tuple[T, ...]]) -> tuple[tuple[T, ...], ...]:
 
 
 # %%
-def bext_bbox(pred: Float[torch.Tensor, "crops 4"], groundtruth: Float[torch.Tensor, "1 4"]) -> int:
+def best_bbox(pred: Float[torch.Tensor, "crops 4"], groundtruth: Float[torch.Tensor, "1 4"]) -> int:
     """
 
-    >>> bext_bbox(
+    >>> best_bbox(
     ...     torch.tensor([[0, 0, 1, 1], [0, 0, 2, 2], [1, 1, 2, 2]]),
     ...     torch.tensor([[0, 0, 1, 1]])
     ... )
     0
 
-    >>> bext_bbox(
+    >>> best_bbox(
     ...     torch.tensor([[0, 0, 0, 0], [0, 0, 2, 2], [1, 1, 2, 2]]),
     ...     torch.tensor([[0, 0, 1, 1]])
     ... )
@@ -574,7 +574,7 @@ def test_step(
         xyxy: Float[torch.Tensor, "4"]
 
         for iter, (img, prompts, xyxys, true_xyxy) in zip(it.count(1), progress):
-            true_i: int = bext_bbox(xyxys, true_xyxy)
+            true_i: int = best_bbox(xyxys, true_xyxy)
 
             # from xyxys to crops
             xywhs: Int[torch.Tensor, "X 4"] = box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").int()  # TODO: cosa farebbe PIL?
@@ -633,7 +633,7 @@ def showtime(
         progress = tqdm(data_loader, desc=f"showtime")
 
         for iter, (img, prompts, xyxys, true_xyxy) in enumerate(progress):
-            true_i: int = bext_bbox(xyxys, true_xyxy)
+            true_i: int = best_bbox(xyxys, true_xyxy)
 
             # from xyxys to crops
             xywhs: Int[torch.Tensor, "X 4"] = box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").int()
