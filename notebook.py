@@ -58,7 +58,14 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.utils import draw_bounding_boxes
 from torchvision.io import read_image, ImageReadMode
-from torchvision.transforms import Compose, Resize, CenterCrop, Normalize, InterpolationMode, ConvertImageDtype
+from torchvision.transforms import (
+    Compose,
+    Resize,
+    CenterCrop,
+    Normalize,
+    InterpolationMode,
+    ConvertImageDtype,
+)
 from torchvision.transforms.functional import crop
 from torchinfo import summary
 from tqdm.notebook import tqdm, trange
@@ -196,9 +203,12 @@ img2yolov8: dict[str, list[BBox]] = defaultdict(
 # %%
 TensorImage = UInt[torch.Tensor, "3 W H"]
 
+
 class CocoDataset(
     Dataset[
-        tuple[TensorImage, list[str], Float[torch.Tensor, "X 4"], Float[torch.Tensor, "4"]]
+        tuple[
+            TensorImage, list[str], Float[torch.Tensor, "X 4"], Float[torch.Tensor, "4"]
+        ]
     ]
 ):
     def __init__(
@@ -222,7 +232,7 @@ class CocoDataset(
                 torch.tensor([
                     (bbox.xmin, bbox.ymin, bbox.xmax, bbox.ymax)
                     for bbox in bboxes
-                    if bbox.confidence > .25  # ensure at least .25 confidence
+                    if bbox.confidence > 0.25  # ensure at least .25 confidence
                 ])
             ]
             for xyxy in [
@@ -231,10 +241,8 @@ class CocoDataset(
         ]
         self.len: int = len(self.items) if limit < 0 else min(limit, len(self.items))
 
-
     def __len__(self) -> int:
         return self.len
-
 
     def __getitem__(
         self, index: int
@@ -247,16 +255,13 @@ class CocoDataset(
 
 # %%
 class CocoTrainDataset(Dataset[tuple[list[TensorImage], list[str], int]]):
-
     def __init__(
         self,
         split: Split,
         img2bboxes: dict[str, list[BBox]],
         limit: int = -1,
     ):
-        self.items: list[
-            tuple[str, list[str], Float[torch.Tensor, "X 4"], int]
-        ] = [
+        self.items: list[tuple[str, list[str], Float[torch.Tensor, "X 4"], int]] = [
             (img, sents, xyxys, i)
             for ref in refs
             if ref.split == split
@@ -280,18 +285,14 @@ class CocoTrainDataset(Dataset[tuple[list[TensorImage], list[str], int]]):
         ]
         self.len: int = len(self.items) if limit < 0 else min(limit, len(self.items))
 
-
     def __len__(self) -> int:
         return self.len
 
-
-    def __getitem__(
-        self, index: int
-    ) -> tuple[list[TensorImage], list[str], int]:
+    def __getitem__(self, index: int) -> tuple[list[TensorImage], list[str], int]:
         file_name, sents, xyxys, i = self.items[index]
         img: TensorImage = read_image(file_name, ImageReadMode.RGB).to(device)
 
-        xywhs: Int[torch.Tensor, "X 4"] = box_convert(xyxys, in_fmt= 'xyxy', out_fmt= 'xywh').int()  # TODO cosa farebbe PIL (bboxes con float)?
+        xywhs: Int[torch.Tensor, "X 4"] = box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").int()  # TODO cosa farebbe PIL (bboxes con float)?
 
         crops: list[TensorImage] = [
             crop(img, top=x, left=y, height=h, width=w)
@@ -300,7 +301,6 @@ class CocoTrainDataset(Dataset[tuple[list[TensorImage], list[str], int]]):
         ]
 
         return crops, sents, i
-
 
 
 # %% [markdown]
@@ -314,7 +314,6 @@ class CocoTrainDataset(Dataset[tuple[list[TensorImage], list[str], int]]):
 
 # %%
 class CLIP_freezed_img_encoder(nn.Module):
-
     def __init__(self, device: torch.device):
         super().__init__()
         clip_model, _ = clip.load("RN50", device=device)
@@ -323,14 +322,12 @@ class CLIP_freezed_img_encoder(nn.Module):
         for p in clip_model.parameters():
             p.requires_grad = False
 
-
     def forward(self, image: Float[torch.Tensor, "crops 3 244 244"]) -> Float[torch.Tensor, "crops 1024"]:
         with torch.no_grad():
             return self.encode_image(image).float()
 
 
 class CLIP_freezed_txt_encoder(nn.Module):
-
     def __init__(self, device: torch.device):
         super().__init__()
         clip_model, _ = clip.load("RN50", device=device)
@@ -339,11 +336,9 @@ class CLIP_freezed_txt_encoder(nn.Module):
         for p in clip_model.parameters():
             p.requires_grad = False
 
-
     def forward(self, text: Int[torch.Tensor, "prompts 77"]) -> Float[torch.Tensor, "prompts 1024"]:
         with torch.no_grad():
             return self.encode_text(text).float()
-
 
 
 # %%
@@ -353,26 +348,23 @@ clip_freezed_txt_encoder: CLIP_freezed_txt_encoder = CLIP_freezed_txt_encoder(de
 
 # %%
 class CLIP_SF_img_encoder(nn.Sequential):
-
     def __init__(self):
         super().__init__(
-           clip_freezed_img_encoder,
-           nn.Linear(1024, 1024),
-           nn.ReLU(),
-           nn.Linear(1024, 1024),
+            clip_freezed_img_encoder,
+            nn.Linear(1024, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 1024),
         )
 
 
 class CLIP_SF_txt_encoder(nn.Sequential):
-
     def __init__(self):
         super().__init__(
-           clip_freezed_txt_encoder,
-           nn.Linear(1024, 1024),
-           nn.ReLU(),
-           nn.Linear(1024, 1024),
+            clip_freezed_txt_encoder,
+            nn.Linear(1024, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 1024),
         )
-
 
 
 # %%
@@ -396,7 +388,6 @@ summary(
 
 # %%
 class CLIP_SF_CORE(nn.Module):
-
     def __init__(
         self,
         visual_encoder: nn.Module,  # visual encoder
@@ -406,7 +397,6 @@ class CLIP_SF_CORE(nn.Module):
         self.visual_encoder = visual_encoder
         self.text_encoder = text_encoder
 
-
     def cosine_similarity(self, crops_z: Float[torch.Tensor, "crops 1024"], prompts_z: Float[torch.Tensor, "prompts 1024"]) -> Float[torch.Tensor, "crops prompts"]:
         # normalise the image and the text
         crops_z = crops_z / crops_z.norm(dim=-1, keepdim=True)
@@ -415,9 +405,7 @@ class CLIP_SF_CORE(nn.Module):
         # evaluate the cosine similarity between the sets of features
         return prompts_z @ crops_z.T
 
-
     def forward(self, crops: Float[torch.Tensor, "crops 3 244 244"], prompts: Int[torch.Tensor, "prompts 77"]) -> Float[torch.Tensor, "crops 1"]:
-
         # step 1: compute crop representation in the latent space
         crop_z: Float[torch.Tensor, "crops 1024"] = self.visual_encoder(crops)
 
@@ -427,14 +415,12 @@ class CLIP_SF_CORE(nn.Module):
         # step 3: evaluate logits
         similarity_matrix: Float[torch.Tensor, "crops prompts"] = self.cosine_similarity(crop_z, prompt_z)
 
-        # step 4: crops classification
+        # step 4: crops classification
         return torch.mean(similarity_matrix, dim=0)
-
 
 
 # %%
 class CLIP_SF(nn.Module):
-
     def __init__(
         self,
         img_preprocess: t.Callable[[TensorImage], Float[torch.Tensor, "3 244 244"]],
@@ -447,9 +433,7 @@ class CLIP_SF(nn.Module):
         self.txt_preprocess = txt_preprocess
         self.core = CLIP_SF_CORE(img_encoder, txt_encoder)
 
-
     def forward(self, crops: list[TensorImage], prompts: list[str]) -> Float[torch.Tensor, "crops 1"]:
-
         # step 1: preprocess crops as required by the visual encoder
         with torch.no_grad():
             crops_preprocessed: Float[torch.Tensor, "crops 3 244 244"] = torch.stack([
@@ -464,10 +448,8 @@ class CLIP_SF(nn.Module):
         return self.core(crops_preprocessed, prompts_preprocessed)
 
 
-
 # %%
 with SummaryWriter() as writer:
-
     writer.add_graph(
         model=CLIP_SF_CORE(
             visual_encoder=CLIP_SF_img_encoder(),
@@ -476,10 +458,8 @@ with SummaryWriter() as writer:
         input_to_model=[
             torch.ones((5, 3, 244, 244)),
             torch.ones((2, 77), dtype=torch.int),
-        ]
+        ],
     )
-
-
 
 # %%
 summary(
@@ -504,7 +484,6 @@ def unzip(batch: list[tuple[T, ...]]) -> tuple[tuple[T, ...], ...]:
     return tuple(zip(*batch))
 
 
-
 # %%
 def bext_bbox(pred: Float[torch.Tensor, "crops 4"], groundtruth: Float[torch.Tensor, "1 4"]) -> int:
     """
@@ -525,13 +504,11 @@ def bext_bbox(pred: Float[torch.Tensor, "crops 4"], groundtruth: Float[torch.Ten
     return torch.argmax(box_iou(pred, groundtruth)).item()
 
 
-
 # %%
 doctest.testmod()
 
 # %%
-loss_fn: t.Callable[[Float[torch.Tensor, 'crops'], Int[torch.Tensor, '1']], Float[torch.Tensor, '1']] = \
-    nn.functional.cross_entropy
+loss_fn: t.Callable[[Float[torch.Tensor, "crops"], Int[torch.Tensor, "1"]], Float[torch.Tensor, "1"]] = nn.functional.cross_entropy
 
 
 # %%
@@ -539,8 +516,7 @@ def training_step(
     model: nn.Module,
     data_loader: DataLoader[tuple[list[TensorImage], list[str], int]],
     optimizer: torch.optim.Optimizer,
-) -> float :
-
+) -> float:
     model.train()
 
     running_loss: float = 0
@@ -551,7 +527,6 @@ def training_step(
     true_is: tuple[int, ...]
 
     for i, (cropss, promptss, true_is) in enumerate(progress):
-
         # forward pass
         preds: list[Float[torch.Tensor, "crops"]] = [
             model(crops, prompts)
@@ -563,7 +538,7 @@ def training_step(
             loss_fn(pred, torch.tensor(true_i))
             for pred, true_i in zip(preds, true_is)
         ])
-        loss: Float[torch.Tensor, '1'] = torch.mean(losses)
+        loss: Float[torch.Tensor, "1"] = torch.mean(losses)
         running_loss += loss.item()
 
         # optimizer zero grad
@@ -575,18 +550,16 @@ def training_step(
         # optimizer step
         optimizer.step()
 
-        progress.set_postfix({ "loss": running_loss / (i + 1) }, refresh=False)
+        progress.set_postfix({"loss": running_loss / (i + 1)}, refresh=False)
 
     return running_loss / len(data_loader)
-
 
 
 # %%
 def test_step(
     model: nn.Module,
     data_loader: DataLoader[tuple[TensorImage, list[str], Float[torch.Tensor, "X 4"], Float[torch.Tensor, "4"]]],
-) -> tuple[float, float] :
-
+) -> tuple[float, float]:
     model.eval()
 
     running_loss: float = 0
@@ -594,18 +567,16 @@ def test_step(
     progress = tqdm(data_loader, desc=f"testing")
 
     with torch.inference_mode():
-
         img: TensorImage
         prompts: list[str]
         xyxys: Float[torch.Tensor, "crops 4"]
         xyxy: Float[torch.Tensor, "4"]
 
         for iter, (img, prompts, xyxys, true_xyxy) in zip(it.count(1), progress):
-
             true_i: int = bext_bbox(xyxys, true_xyxy)
 
             # from xyxys to crops
-            xywhs: Int[torch.Tensor, "X 4"] = box_convert(xyxys, in_fmt= 'xyxy', out_fmt= 'xywh').int()  # TODO: cosa farebbe PIL?
+            xywhs: Int[torch.Tensor, "X 4"] = box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").int()  # TODO: cosa farebbe PIL?
 
             crops: list[TensorImage] = [
                 crop(img, top=x, left=y, height=h, width=w)
@@ -614,7 +585,7 @@ def test_step(
             ]
 
             # forward pass
-            model_output: Float[torch.Tensor, 'crops'] = model(crops, prompts)
+            model_output: Float[torch.Tensor, "crops"] = model(crops, prompts)
 
             # calculate loss
             loss: float = loss_fn(model_output, torch.tensor(true_i)).item()
@@ -637,11 +608,10 @@ def test_step(
                     "loss": running_loss / iter,
                     "iou": running_acc / iter,
                 },
-                refresh=False
+                refresh=False,
             )
 
         return running_loss / len(data_loader), running_acc / len(data_loader)
-
 
 
 # %%
@@ -651,11 +621,9 @@ def showtime(
     writer: SummaryWriter,
     global_step: int,
 ) -> None:
-
     model.eval()
 
     with torch.inference_mode():
-
         img: TensorImage
         prompts: list[str]
         xyxys: Float[torch.Tensor, "crops 4"]
@@ -664,11 +632,10 @@ def showtime(
         progress = tqdm(data_loader, desc=f"showtime")
 
         for iter, (img, prompts, xyxys, true_xyxy) in enumerate(progress):
-
             true_i: int = bext_bbox(xyxys, true_xyxy)
 
             # from xyxys to crops
-            xywhs: Int[torch.Tensor, "X 4"] = box_convert(xyxys, in_fmt= 'xyxy', out_fmt= 'xywh').int()
+            xywhs: Int[torch.Tensor, "X 4"] = box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").int()
 
             crops: list[TensorImage] = [
                 crop(img, top=x, left=y, height=h, width=w)
@@ -677,7 +644,7 @@ def showtime(
             ]
 
             # forward pass
-            model_output: Float[torch.Tensor, 'crops'] = model(crops, prompts)
+            model_output: Float[torch.Tensor, "crops"] = model(crops, prompts)
 
             # get index of the predicted bounding box to compute IoU accuracy
             pred_i: int = torch.argmax(model_output).item()
@@ -690,10 +657,9 @@ def showtime(
                 tag=f"{iter + 1}",
                 img_tensor=img,
                 box_tensor=torch.stack((xyxys[pred_i], xyxys[true_i], true_xyxy.squeeze())),
-                labels=['prediction', 'best region proposal', 'ground truth'],
+                labels=["prediction", "best region proposal", "ground truth"],
                 global_step=global_step,
             )
-
 
 
 # %% [markdown]
@@ -748,51 +714,43 @@ def training_loop(
     name: str,
     model: nn.Module,
     epochs: int,
-    optimizer: t.Callable[[t.Iterable[torch.Tensor]], torch.optim.Optimizer]
+    optimizer: t.Callable[[t.Iterable[torch.Tensor]], torch.optim.Optimizer],
 ) -> None:
-
     # create a logger for the experiment
-    with SummaryWriter(f'runs/{name}') as writer:
-
+    with SummaryWriter(f"runs/{name}") as writer:
         # computes evaluation results before training
-        print('Before training:')
+        print("Before training:")
         test_loss, test_accuracy = test_step(
-            model = model,
-            data_loader = test_loader,
+            model=model,
+            data_loader=test_loader,
         )
         val_loss, val_accuracy = test_step(
             model=model,
             data_loader=val_loader,
         )
 
-        showtime(
-            model = model,
-            data_loader = showtime_loader,
-            writer = writer,
-            global_step=0
-        )
+        showtime(model=model, data_loader=showtime_loader, writer=writer, global_step=0)
 
         # log to TensorBoard
         writer.add_scalars(
-            main_tag='loss',
+            main_tag="loss",
             tag_scalar_dict={
-                'test': test_loss,
-                'val': val_loss,
+                "test": test_loss,
+                "val": val_loss,
             },
             global_step=0,
         )
         writer.add_scalars(
-            main_tag='accuracy',
+            main_tag="accuracy",
             tag_scalar_dict={
-                'test': test_accuracy,
-                'val': val_accuracy,
+                "test": test_accuracy,
+                "val": val_accuracy,
             },
             global_step=0,
         )
 
         progress = trange(epochs, desc="epochs")
         for epoch in progress:
-
             train_loss = training_step(
                 model=model,
                 data_loader=train_loader,
@@ -804,20 +762,19 @@ def training_loop(
                 data_loader=val_loader,
             )
 
-
             # log to TensorBoard
             writer.add_scalars(
-                main_tag='loss',
+                main_tag="loss",
                 tag_scalar_dict={
-                    'train': train_loss,
-                    'val': val_loss,
+                    "train": train_loss,
+                    "val": val_loss,
                 },
                 global_step=epoch + 1,
             )
             writer.add_scalars(
-                main_tag='accuracy',
+                main_tag="accuracy",
                 tag_scalar_dict={
-                    'val': val_accuracy,
+                    "val": val_accuracy,
                 },
                 global_step=epoch + 1,
             )
@@ -828,7 +785,7 @@ def training_loop(
                     "val/loss": val_loss,
                     "val/accuracy": val_accuracy,
                 },
-                refresh=False
+                refresh=False,
             )
 
         # compute final evaluation results
@@ -840,28 +797,27 @@ def training_loop(
         )
 
         showtime(
-            model = model,
-            data_loader = showtime_loader,
-            writer = writer,
+            model=model,
+            data_loader=showtime_loader,
+            writer=writer,
             global_step=epochs,
         )
 
         # log to TensorBoard
         writer.add_scalars(
-            main_tag='loss',
+            main_tag="loss",
             tag_scalar_dict={
-                'test': test_loss,
+                "test": test_loss,
             },
             global_step=epochs,
         )
         writer.add_scalars(
-            main_tag='accuracy',
+            main_tag="accuracy",
             tag_scalar_dict={
-                'test': test_accuracy,
+                "test": test_accuracy,
             },
             global_step=epochs,
         )
-
 
 
 # %%
@@ -875,6 +831,7 @@ def transform(n_px: int):
         CenterCrop(n_px),
         Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
     ])
+
 
 preprocess: Compose = transform(244)
 
