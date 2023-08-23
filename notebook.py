@@ -47,6 +47,7 @@ import torch
 import torch.nn as nn
 import torchvision
 import numpy as np
+import pandas as pd
 import itertools as it
 import typing as t
 import csv
@@ -715,7 +716,10 @@ def training_loop(
     model: nn.Module,
     epochs: int,
     optimizer: t.Callable[[t.Iterable[torch.Tensor]], torch.optim.Optimizer],
-) -> None:
+) -> pd.DataFrame:
+    loss: dict[str, list[float]] = defaultdict(list)
+    accs: dict[str, list[float]] = defaultdict(list)
+
     # create a logger for the experiment
     with SummaryWriter(f"runs/{name}") as writer:
         # computes evaluation results before training
@@ -730,6 +734,11 @@ def training_loop(
         )
 
         showtime(model=model, data_loader=showtime_loader, writer=writer, global_step=0)
+
+        loss["test"].append(test_loss)
+        accs["test"].append(test_accuracy)
+        loss["val"].append(val_loss)
+        accs["val"].append(val_accuracy)
 
         # log to TensorBoard
         writer.add_scalars(
@@ -761,6 +770,10 @@ def training_loop(
                 model=model,
                 data_loader=val_loader,
             )
+
+            loss["train"].append(train_loss)
+            loss["val"].append(val_loss)
+            accs["val"].append(val_accuracy)
 
             # log to TensorBoard
             writer.add_scalars(
@@ -803,6 +816,9 @@ def training_loop(
             global_step=epochs,
         )
 
+        loss["test"].append(test_loss)
+        accs["test"].append(test_accuracy)
+
         # log to TensorBoard
         writer.add_scalars(
             main_tag="loss",
@@ -817,6 +833,23 @@ def training_loop(
                 "test": test_accuracy,
             },
             global_step=epochs,
+        )
+
+        return pd.concat(
+            [
+                pd.concat(
+                    [pd.Series(v).describe() for v in loss.values()],
+                    axis=1,
+                    keys=[k for k in loss.keys()],
+                ),
+                pd.concat(
+                    [pd.Series(v).describe() for v in accs.values()],
+                    axis=1,
+                    keys=[k for k in accs.keys()],
+                ),
+            ],
+            axis=1,
+            keys=["loss", "accuracy"],
         )
 
 
@@ -848,6 +881,7 @@ preprocess: Compose = transform(244)
 # batch size: 16<br>
 
 # %%
+name: str = "net1"
 net1: CLIP_SF = CLIP_SF(
     img_preprocess=preprocess,
     txt_preprocess=clip.tokenize,
@@ -860,12 +894,16 @@ net1: CLIP_SF = CLIP_SF(
 )
 
 # %%
-training_loop(
-    name="net1",
+report: pd.DataFrame = training_loop(
+    name=name,
     model=net1,
     optimizer=lambda params: torch.optim.SGD(params=params, lr=1e-2, weight_decay=1e-6, momentum=.9),
     epochs=5,
 )
+
+# %%
+report.to_csv(f"{name}.csv")
+display(report)
 
 # %% [markdown]
 # ## Architettura 2
@@ -880,6 +918,7 @@ training_loop(
 # batch size: 16<br>
 
 # %%
+name: str = "net2"
 net2: CLIP_SF = CLIP_SF(
     img_preprocess=preprocess,
     txt_preprocess=clip.tokenize,
@@ -904,12 +943,16 @@ net2: CLIP_SF = CLIP_SF(
 )
 
 # %%
-training_loop(
-    name="net2",
+report: pd.DataFrame = training_loop(
+    name=name,
     model=net2,
     optimizer=lambda params: torch.optim.SGD(params=params, lr=1e-2, weight_decay=1e-6, momentum=.9),
     epochs=5,
 )
+
+# %%
+report.to_csv(f"{name}.csv")
+display(report)
 
 # %% [markdown]
 # ## Architettura 3
@@ -924,6 +967,7 @@ training_loop(
 # batch size: 16<br>
 
 # %%
+name: str = "net3"
 net3: CLIP_SF = CLIP_SF(
     img_preprocess=preprocess,
     txt_preprocess=clip.tokenize,
@@ -948,12 +992,16 @@ net3: CLIP_SF = CLIP_SF(
 )
 
 # %%
-training_loop(
-    name="net3",
+report: pd.DataFrame = training_loop(
+    name=name,
     model=net3,
     optimizer=lambda params: torch.optim.Adadelta(params=params, lr=15e-4, weight_decay=1e-6),
     epochs=5,
 )
+
+# %%
+report.to_csv(f"{name}.csv")
+display(report)
 
 # %% [markdown]
 # ## Architettura 4
@@ -968,6 +1016,7 @@ training_loop(
 # batch size: 16<br>
 
 # %%
+name: str = "net4"
 net4: CLIP_SF = CLIP_SF(
     img_preprocess=preprocess,
     txt_preprocess=clip.tokenize,
@@ -984,9 +1033,13 @@ net4: CLIP_SF = CLIP_SF(
 )
 
 # %%
-training_loop(
-    name="net4",
+report: pd.DataFrame = training_loop(
+    name=name,
     model=net4,
     optimizer=lambda params: torch.optim.SGD(params=params, lr=1e-2, weight_decay=1e-6, momentum=.9),
     epochs=5,
 )
+
+# %%
+report.to_csv(f"{name}.csv")
+display(report)
