@@ -255,15 +255,33 @@ class CocoDataset(
 
 
 # %%
-class CocoTrainDataset(Dataset[tuple[list[TensorImage], list[str], int]]):
+class CocoTrainDataset(
+    Dataset[
+        tuple[
+            list[TensorImage],
+            list[str],
+            int,
+            Float[torch.Tensor, "crops 4"],
+            Float[torch.Tensor, "1 4"],
+        ]
+    ]
+):
     def __init__(
         self,
         split: Split,
         img2bboxes: dict[str, list[BBox]],
         limit: int = -1,
     ):
-        self.items: list[tuple[str, list[str], Float[torch.Tensor, "X 4"], int]] = [
-            (img, sents, xyxys, i)
+        self.items: list[
+            tuple[
+                str,
+                list[str],
+                int,
+                Float[torch.Tensor, "X 4"],
+                Float[torch.Tensor, "1 4"],
+            ]
+        ] = [
+            (img, sents, i, xyxys, xyxy)
             for ref in refs
             if ref.split == split
             for img in [os.path.join(path_images, ref.file_name)]
@@ -281,7 +299,7 @@ class CocoTrainDataset(Dataset[tuple[list[TensorImage], list[str], int]]):
                 torch.tensor([(ref.xmin, ref.ymin, ref.xmax, ref.ymax)])
             ]
             for ious in [box_iou(xyxys, xyxy)]
-            if torch.max(ious).item() > .5  # ensure at least .5 of IoU
+            if torch.max(ious).item() > .5  # ensure at least .5 of maximum IoU
             for i in [torch.argmax(ious).item()]
         ]
         self.len: int = len(self.items) if limit < 0 else min(limit, len(self.items))
@@ -289,8 +307,16 @@ class CocoTrainDataset(Dataset[tuple[list[TensorImage], list[str], int]]):
     def __len__(self) -> int:
         return self.len
 
-    def __getitem__(self, index: int) -> tuple[list[TensorImage], list[str], int]:
-        file_name, sents, xyxys, i = self.items[index]
+    def __getitem__(
+        self, index: int
+    ) -> tuple[
+        list[TensorImage],
+        list[str],
+        int,
+        Float[torch.Tensor, "crops 4"],
+        Float[torch.Tensor, "1 4"],
+    ]:
+        file_name, sents, i, xyxys, xyxy = self.items[index]
         img: TensorImage = read_image(file_name, ImageReadMode.RGB).to(device)
 
         xywhs: Int[torch.Tensor, "X 4"] = box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").round().int()
@@ -301,7 +327,7 @@ class CocoTrainDataset(Dataset[tuple[list[TensorImage], list[str], int]]):
             for [x, y, w, h] in [xywh.tolist()]
         ]
 
-        return crops, sents, i
+        return crops, sents, i, xyxys, xyxy
 
 
 # %% [markdown]
@@ -515,23 +541,33 @@ loss_fn: t.Callable[[Float[torch.Tensor, "crops"], Int[torch.Tensor, "1"]], Floa
 # %%
 def training_step(
     model: nn.Module,
-    data_loader: DataLoader[tuple[list[TensorImage], list[str], int]],
+    data_loader: DataLoader[
+        tuple[
+            tuple[TensorImage, ...],
+            tuple[str, ...],
+            int,
+            Float[torch.Tensor, "crops 4"],
+            Float[torch.Tensor, "1 4"],
+        ]
+    ],
     optimizer: torch.optim.Optimizer,
-) -> float:
+) -> tuple[float, float]:
     model.train()
 
     running_loss: float = 0
+    running_acc: float = 0
     progress = tqdm(data_loader, desc=f"training")
 
     cropss: tuple[tuple[TensorImage, ...], ...]
-    promptss: tuple[list[str], ...]
+    promptss: tuple[tuple[str, ...], ...]
     true_is: tuple[int, ...]
+    xyxyss: tuple[Float[torch.Tensor, "crops 4"], ...]
+    true_xyxys: tuple[Float[torch.Tensor, "1 4"], ...]
 
-    for i, (cropss, promptss, true_is) in enumerate(progress):
+    for iter, (cropss, promptss, true_is, xyxyss, true_xyxys) in zip(it.count(1), progress):
         # forward pass
         preds: list[Float[torch.Tensor, "crops"]] = [
-            model(crops, prompts)
-            for crops, prompts in zip(cropss, promptss)
+            model(crops, prompts) for crops, prompts in zip(cropss, promptss)
         ]
 
         # calculate loss
@@ -551,9 +587,33 @@ def training_step(
         # optimizer step
         optimizer.step()
 
-        progress.set_postfix({"loss": running_loss / (i + 1)}, refresh=False)
+        # calculate IoU accuracy
+        with torch.inference_mode():
+            # # get indexes of the predicted bounding box to compute IoU accuracy
+            pred_is: list[int] = [
+                torch.argmax(pred).item()
+                for pred in preds
+            ]
 
-    return running_loss / len(data_loader)
+            # # get predicted bounding boxes
+            pred_xyxys: list[Float[torch.Tensor, "4"]] = [
+                xyxys[pred_i]
+                for xyxys, pred_i in zip(xyxyss, pred_is)
+            ]
+
+            # # IoU
+            acc: float = torch.mean(box_iou(torch.cat(true_xyxys), torch.stack(pred_xyxys)).diagonal()).item()
+            running_acc += acc
+
+            progress.set_postfix(
+                {
+                    "loss": running_loss / iter,
+                    "iou": running_acc / iter,
+                },
+                refresh=False,
+            )
+
+    return running_loss / len(data_loader), running_acc / len(data_loader)
 
 
 # %%
@@ -672,7 +732,13 @@ LIMIT: int = 10 * BATCH_SIZE
 NUM_WORKERS: int = 0  # os.cpu_count() or 1
 
 train_loader: DataLoader[
-    tuple[list[TensorImage], list[str], int]
+    tuple[
+        tuple[TensorImage, ...],
+        tuple[str, ...],
+        int,
+        Float[torch.Tensor, "crops 4"],
+        Float[torch.Tensor, "1 4"],
+    ]
 ] = DataLoader(
     dataset=CocoTrainDataset(split="train", img2bboxes=img2detr, limit=LIMIT),
     generator=g,
@@ -680,6 +746,15 @@ train_loader: DataLoader[
     num_workers=NUM_WORKERS,
     collate_fn=unzip,
     shuffle=True,
+)
+
+bna_train_loader: DataLoader[
+    tuple[TensorImage, list[str], Float[torch.Tensor, "X 4"], Float[torch.Tensor, "4"]]
+] = DataLoader(
+    dataset=CocoDataset(split="train", img2bboxes=img2detr, limit=LIMIT),
+    batch_size=None,
+    num_workers=NUM_WORKERS,
+    shuffle=False,
 )
 
 val_loader: DataLoader[
@@ -724,6 +799,10 @@ def training_loop(
     with SummaryWriter(f"runs/{name}") as writer:
         # computes evaluation results before training
         print("Before training:")
+        bna_train_loss, bna_train_accuracy = test_step(
+            model=model,
+            data_loader=bna_train_loader,
+        )
         test_loss, test_accuracy = test_step(
             model=model,
             data_loader=test_loader,
@@ -735,6 +814,8 @@ def training_loop(
 
         showtime(model=model, data_loader=showtime_loader, writer=writer, global_step=0)
 
+        loss["BA train"].append(bna_train_loss)
+        accs["BA train"].append(bna_train_accuracy)
         loss["test"].append(test_loss)
         accs["test"].append(test_accuracy)
         loss["val"].append(val_loss)
@@ -744,6 +825,7 @@ def training_loop(
         writer.add_scalars(
             main_tag="loss",
             tag_scalar_dict={
+                "BA train": bna_train_loss,
                 "test": test_loss,
                 "val": val_loss,
             },
@@ -752,6 +834,7 @@ def training_loop(
         writer.add_scalars(
             main_tag="accuracy",
             tag_scalar_dict={
+                "BA train": bna_train_accuracy,
                 "test": test_accuracy,
                 "val": val_accuracy,
             },
@@ -760,7 +843,7 @@ def training_loop(
 
         progress = trange(epochs, desc="epochs")
         for epoch in progress:
-            train_loss = training_step(
+            train_loss, train_accuracy = training_step(
                 model=model,
                 data_loader=train_loader,
                 optimizer=optimizer(model.parameters()),
@@ -772,6 +855,7 @@ def training_loop(
             )
 
             loss["train"].append(train_loss)
+            accs["train"].append(train_accuracy)
             loss["val"].append(val_loss)
             accs["val"].append(val_accuracy)
 
@@ -787,6 +871,7 @@ def training_loop(
             writer.add_scalars(
                 main_tag="accuracy",
                 tag_scalar_dict={
+                    "train": train_accuracy,
                     "val": val_accuracy,
                 },
                 global_step=epoch + 1,
@@ -796,6 +881,7 @@ def training_loop(
                 {
                     "train/loss": train_loss,
                     "val/loss": val_loss,
+                    "train/accuracy": train_accuracy,
                     "val/accuracy": val_accuracy,
                 },
                 refresh=False,
@@ -804,6 +890,10 @@ def training_loop(
         # compute final evaluation results
         print("After training:")
 
+        bna_train_loss, bna_train_accuracy = test_step(
+            model=model,
+            data_loader=bna_train_loader,
+        )
         test_loss, test_accuracy = test_step(
             model=model,
             data_loader=test_loader,
@@ -816,6 +906,8 @@ def training_loop(
             global_step=epochs,
         )
 
+        loss["BA train"].append(bna_train_loss)
+        accs["BA train"].append(bna_train_accuracy)
         loss["test"].append(test_loss)
         accs["test"].append(test_accuracy)
 
@@ -823,6 +915,7 @@ def training_loop(
         writer.add_scalars(
             main_tag="loss",
             tag_scalar_dict={
+                "BA train": bna_train_loss,
                 "test": test_loss,
             },
             global_step=epochs,
@@ -830,6 +923,7 @@ def training_loop(
         writer.add_scalars(
             main_tag="accuracy",
             tag_scalar_dict={
+                "BA train": bna_train_accuracy,
                 "test": test_accuracy,
             },
             global_step=epochs,
