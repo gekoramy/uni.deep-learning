@@ -420,15 +420,23 @@ class CLIP_SF_CORE(nn.Module):
         self.visual_encoder = visual_encoder
         self.text_encoder = text_encoder
 
-    def cosine_similarity(self, crops_z: Float[torch.Tensor, "crops 1024"], prompts_z: Float[torch.Tensor, "prompts 1024"]) -> Float[torch.Tensor, "crops prompts"]:
+    def cosine_similarity(
+        self,
+        crops_z: Float[torch.Tensor, "crops 1024"],
+        prompts_z: Float[torch.Tensor, "prompts 1024"],
+    ) -> Float[torch.Tensor, "prompts crops"]:
         # normalise the image and the text
-        crops_z = crops_z / crops_z.norm(dim=-1, keepdim=True)
-        prompts_z = prompts_z / prompts_z.norm(dim=-1, keepdim=True)
+        crops_z: Float[torch.Tensor, "crops 1024"] = crops_z / crops_z.norm(dim=-1, keepdim=True)
+        prompts_z: Float[torch.Tensor, "prompts 1024"] = prompts_z / prompts_z.norm(dim=-1, keepdim=True)
 
         # evaluate the cosine similarity between the sets of features
         return prompts_z @ crops_z.T
 
-    def forward(self, crops: Float[torch.Tensor, "crops 3 244 244"], prompts: Int[torch.Tensor, "prompts 77"]) -> Float[torch.Tensor, "crops 1"]:
+    def forward(
+        self,
+        crops: Float[torch.Tensor, "crops 3 244 244"],
+        prompts: Int[torch.Tensor, "prompts 77"],
+    ) -> Float[torch.Tensor, "crops 1"]:
         # step 1: compute crop representation in the latent space
         crop_z: Float[torch.Tensor, "crops 1024"] = self.visual_encoder(crops)
 
@@ -436,7 +444,7 @@ class CLIP_SF_CORE(nn.Module):
         prompt_z: Int[torch.Tensor, "prompts 1024"] = self.text_encoder(prompts)
 
         # step 3: evaluate logits
-        similarity_matrix: Float[torch.Tensor, "crops prompts"] = self.cosine_similarity(crop_z, prompt_z)
+        similarity_matrix: Float[torch.Tensor, "prompts crops"] = self.cosine_similarity(crop_z, prompt_z)
 
         # step 4: crops classification
         return torch.mean(similarity_matrix, dim=0)
@@ -786,7 +794,7 @@ def eval_step(
             {
                 "iou": ious,
                 "cos similarity": coss,
-                "eucidlean distance": euds,
+                "euclidean distance": euds,
             }
         )
 
@@ -1219,14 +1227,19 @@ def compare(reports: dict[str, pd.DataFrame]) -> pd.DataFrame:
             "mA[IoU .7]": [(report["iou"] >= 0.7).sum() / report["iou"].count() for report in reports.values()],
             "mIoU": [report["iou"].mean() for report in reports.values()],
             "mCos": [report["cos similarity"].mean() for report in reports.values()],
-            "mED": [report["eucidlean distance"].mean() for report in reports.values()],
+            "mED": [report["euclidean distance"].mean() for report in reports.values()],
         },
         index=reports.keys(),
     )
 
 
 # %%
-models: dict[str, torch.nn.Module] = {"net1": net1, "net2": net2, "net3": net3}
+models: dict[str, torch.nn.Module] = {
+    "net1": net1,
+    "net2": net2,
+    "net3": net3,
+    "net4": net4,
+}
 
 reports: dict[str, pd.DataFrame] = {
     k: eval_step(v, test_loader, preprocess) for k, v in models.items()
