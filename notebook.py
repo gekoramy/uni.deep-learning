@@ -1229,11 +1229,12 @@ def compare(reports: dict[str, pd.DataFrame]) -> pd.DataFrame:
 models: dict[str, torch.nn.Module] = {"net1": net1, "net2": net2, "net3": net3}
 
 reports: dict[str, pd.DataFrame] = {
-    k: eval_step(net1, test_loader, preprocess) for k, v in models.items()
+    k: eval_step(v, test_loader, preprocess) for k, v in models.items()
 }
 
 # %%
 display(*[report.describe() for report in reports.values()])
 
 # %%
-display(compare(reports))
+cmp: pd.DataFrame = compare(reports)
+display(cmp)
