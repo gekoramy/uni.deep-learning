@@ -340,37 +340,33 @@ class CocoTrainDataset(
 # In the following cell we create a neural network that builds a linear head on top of the visual encoder of CLIP.
 
 # %%
-class CLIP_freezed_img_encoder(nn.Module):
-    def __init__(self, device: torch.device):
-        super().__init__()
-        clip_model, _ = clip.load("RN50", device=device)
-        self.encode_image = clip_model.encode_image
+clip_model, _ = clip.load("RN50", device=device)
+clip_model.eval()
 
-        for p in clip_model.parameters():
-            p.requires_grad = False
-
-    def forward(self, image: Float[torch.Tensor, "crops 3 244 244"]) -> Float[torch.Tensor, "crops 1024"]:
-        with torch.no_grad():
-            return self.encode_image(image).float()
-
-
-class CLIP_freezed_txt_encoder(nn.Module):
-    def __init__(self, device: torch.device):
-        super().__init__()
-        clip_model, _ = clip.load("RN50", device=device)
-        self.encode_text = clip_model.encode_text
-
-        for p in clip_model.parameters():
-            p.requires_grad = False
-
-    def forward(self, text: Int[torch.Tensor, "prompts 77"]) -> Float[torch.Tensor, "prompts 1024"]:
-        with torch.no_grad():
-            return self.encode_text(text).float()
+for p in clip_model.parameters():
+    p.requires_grad = False
 
 
 # %%
-clip_freezed_img_encoder: CLIP_freezed_img_encoder = CLIP_freezed_img_encoder(device=device)
-clip_freezed_txt_encoder: CLIP_freezed_txt_encoder = CLIP_freezed_txt_encoder(device=device)
+class CLIP_freezed_img_encoder(nn.Module):
+    def forward(
+        self, image: Float[torch.Tensor, "crops 3 244 244"]
+    ) -> Float[torch.Tensor, "crops 1024"]:
+        with torch.no_grad():
+            return clip_model.encode_image(image).float()
+
+
+class CLIP_freezed_txt_encoder(nn.Module):
+    def forward(
+        self, text: Int[torch.Tensor, "prompts 77"]
+    ) -> Float[torch.Tensor, "prompts 1024"]:
+        with torch.no_grad():
+            return clip_model.encode_text(text).float()
+
+
+# %%
+clip_freezed_img_encoder: CLIP_freezed_img_encoder = CLIP_freezed_img_encoder()
+clip_freezed_txt_encoder: CLIP_freezed_txt_encoder = CLIP_freezed_txt_encoder()
 
 
 # %%
@@ -721,6 +717,78 @@ def showtime(
                 labels=["prediction", "best region proposal", "ground truth"],
                 global_step=global_step,
             )
+
+
+# %%
+def eval_step(
+    model: nn.Module,
+    data_loader: DataLoader[tuple[TensorImage, list[str], Float[torch.Tensor, "X 4"], Float[torch.Tensor, "4"]]],
+    img_preprocess: t.Callable[[TensorImage], Float[torch.Tensor, "3 244 244"]],
+) -> pd.DataFrame:
+    model.eval()
+
+    ious: list[float] = []
+    coss: list[float] = []
+    euds: list[float] = []
+
+    with torch.inference_mode():
+        img: TensorImage
+        prompts: list[str]
+        xyxys: Float[torch.Tensor, "crops 4"]
+        xyxy: Float[torch.Tensor, "4"]
+
+        progress = tqdm(data_loader, desc=f"eval")
+
+        for iter, (img, prompts, xyxys, true_xyxy) in enumerate(progress):
+            true_i: int = best_bbox(xyxys, true_xyxy)
+
+            # from xyxys to crops
+            xywhs: Int[torch.Tensor, "X 4"] = box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").round().int()
+
+            crops: list[TensorImage] = [
+                crop(img, top=x, left=y, height=h, width=w)
+                for xywh in xywhs
+                for [x, y, w, h] in [xywh.tolist()]
+            ]
+
+            # from true_xyxy to true_crop
+            true_xywh: Int[torch.Tensor, "1 4"] = box_convert(true_xyxy, in_fmt="xyxy", out_fmt="xywh").round().int()
+
+            true_crop: TensorImage
+            [true_crop] = [
+                crop(img, top=x, left=y, height=h, width=w)
+                for xywh in true_xywh
+                for [x, y, w, h] in [xywh.tolist()]
+            ]
+
+            # forward pass
+            model_output: Float[torch.Tensor, "crops"] = model(crops, prompts)
+
+            # get index of the predicted bounding box to compute IoU accuracy
+            pred_i: int = torch.argmax(model_output).item()
+
+            # get predicted bounding
+            pred_xyxy: Float[torch.Tensor, "1 4"] = xyxys[pred_i].unsqueeze(0)
+
+            iou: float = box_iou(true_xyxy, pred_xyxy).item()
+            ious.append(iou)
+
+            true_z: Float[torch.Tensor, "1 1024"] = clip_freezed_img_encoder(img_preprocess(true_crop).unsqueeze(0))
+            pred_z: Float[torch.Tensor, "1 1024"] = clip_freezed_img_encoder(img_preprocess(crops[pred_i]).unsqueeze(0))
+
+            cos: float = torch.nn.functional.cosine_similarity(true_z, pred_z).item()
+            coss.append(cos)
+
+            eud: float = torch.cdist(true_z, pred_z, p=2).item()
+            euds.append(eud)
+
+        return pd.DataFrame(
+            {
+                "iou": ious,
+                "cos similarity": coss,
+                "eucidlean distance": euds,
+            }
+        )
 
 
 # %% [markdown]
@@ -1137,3 +1205,35 @@ report: pd.DataFrame = training_loop(
 # %%
 report.to_csv(f"{name}.csv")
 display(report)
+
+
+# %% [markdown]
+# Comparing
+
+# %%
+def compare(reports: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "mA[IoU .3]": [(report["iou"] >= 0.3).sum() / report["iou"].count() for report in reports.values()],
+            "mA[IoU .5]": [(report["iou"] >= 0.5).sum() / report["iou"].count() for report in reports.values()],
+            "mA[IoU .7]": [(report["iou"] >= 0.7).sum() / report["iou"].count() for report in reports.values()],
+            "mIoU": [report["iou"].mean() for report in reports.values()],
+            "mCos": [report["cos similarity"].mean() for report in reports.values()],
+            "mED": [report["eucidlean distance"].mean() for report in reports.values()],
+        },
+        index=reports.keys(),
+    )
+
+
+# %%
+models: dict[str, torch.nn.Module] = {"net1": net1, "net2": net2, "net3": net3}
+
+reports: dict[str, pd.DataFrame] = {
+    k: eval_step(net1, test_loader, preprocess) for k, v in models.items()
+}
+
+# %%
+display(*[report.describe() for report in reports.values()])
+
+# %%
+display(compare(reports))
