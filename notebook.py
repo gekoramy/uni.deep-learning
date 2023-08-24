@@ -866,7 +866,7 @@ def transform(n_px: int):
     ])
 
 
-preprocess: Compose = transform(244)
+preprocess: Compose = transform(224)
 
 # %% [markdown]
 # ## Architettura 1
