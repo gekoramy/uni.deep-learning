@@ -293,7 +293,7 @@ class CocoTrainDataset(Dataset[tuple[list[TensorImage], list[str], int]]):
         file_name, sents, xyxys, i = self.items[index]
         img: TensorImage = read_image(file_name, ImageReadMode.RGB).to(device)
 
-        xywhs: Int[torch.Tensor, "X 4"] = box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").int()  # TODO cosa farebbe PIL (bboxes con float)?
+        xywhs: Int[torch.Tensor, "X 4"] = box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").round().int()
 
         crops: list[TensorImage] = [
             crop(img, top=x, left=y, height=h, width=w)
@@ -577,7 +577,7 @@ def test_step(
             true_i: int = best_bbox(xyxys, true_xyxy)
 
             # from xyxys to crops
-            xywhs: Int[torch.Tensor, "X 4"] = box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").int()  # TODO: cosa farebbe PIL?
+            xywhs: Int[torch.Tensor, "X 4"] = box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").round().int()
 
             crops: list[TensorImage] = [
                 crop(img, top=x, left=y, height=h, width=w)
@@ -636,7 +636,7 @@ def showtime(
             true_i: int = best_bbox(xyxys, true_xyxy)
 
             # from xyxys to crops
-            xywhs: Int[torch.Tensor, "X 4"] = box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").int()
+            xywhs: Int[torch.Tensor, "X 4"] = box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").round().int()
 
             crops: list[TensorImage] = [
                 crop(img, top=x, left=y, height=h, width=w)
