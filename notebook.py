@@ -805,7 +805,9 @@ def eval_step(
 BATCH_SIZE: int = 512
 LIMIT: int = 10 * BATCH_SIZE
 NUM_WORKERS: int = 0  # os.cpu_count() or 1
+EPOCHS: int = 100
 
+#%%
 train_loader: DataLoader[
     tuple[
         tuple[TensorImage, ...],
@@ -864,7 +866,6 @@ showtime_loader: DataLoader[
 def training_loop(
     name: str,
     model: nn.Module,
-    epochs: int,
     optimizer: t.Callable[[t.Iterable[torch.Tensor]], torch.optim.Optimizer],
 ) -> pd.DataFrame:
     loss: dict[str, list[float]] = defaultdict(list)
@@ -916,7 +917,7 @@ def training_loop(
             global_step=0,
         )
 
-        progress = trange(epochs, desc="epochs")
+        progress = trange(EPOCHS, desc="EPOCHS")
         for epoch in progress:
             train_loss, train_accuracy = training_step(
                 model=model,
@@ -978,7 +979,7 @@ def training_loop(
             model=model,
             data_loader=showtime_loader,
             writer=writer,
-            global_step=epochs,
+            global_step=EPOCHS,
         )
 
         loss["BA train"].append(bna_train_loss)
@@ -993,7 +994,7 @@ def training_loop(
                 "BA train": bna_train_loss,
                 "test": test_loss,
             },
-            global_step=epochs,
+            global_step=EPOCHS,
         )
         writer.add_scalars(
             main_tag="accuracy",
@@ -1001,7 +1002,7 @@ def training_loop(
                 "BA train": bna_train_accuracy,
                 "test": test_accuracy,
             },
-            global_step=epochs,
+            global_step=EPOCHS,
         )
 
         return pd.concat(
@@ -1050,7 +1051,6 @@ preprocess: Compose = transform(224)
 # batch size: 16<br>
 
 # %%
-name: str = "net1"
 net1: CLIP_SF = CLIP_SF(
     img_preprocess=preprocess,
     txt_preprocess=clip.tokenize,
@@ -1061,18 +1061,6 @@ net1: CLIP_SF = CLIP_SF(
     ),
     txt_encoder=clip_freezed_txt_encoder,
 )
-
-# %%
-report: pd.DataFrame = training_loop(
-    name=name,
-    model=net1,
-    optimizer=lambda params: torch.optim.SGD(params=params, lr=1e-2, weight_decay=1e-6, momentum=.9),
-    epochs=5,
-)
-
-# %%
-report.to_csv(f"{name}.csv")
-display(report)
 
 # %% [markdown]
 # ## Architettura 2
@@ -1087,7 +1075,6 @@ display(report)
 # batch size: 16<br>
 
 # %%
-name: str = "net2"
 net2: CLIP_SF = CLIP_SF(
     img_preprocess=preprocess,
     txt_preprocess=clip.tokenize,
@@ -1111,18 +1098,6 @@ net2: CLIP_SF = CLIP_SF(
     ),
 )
 
-# %%
-report: pd.DataFrame = training_loop(
-    name=name,
-    model=net2,
-    optimizer=lambda params: torch.optim.SGD(params=params, lr=1e-2, weight_decay=1e-6, momentum=.9),
-    epochs=5,
-)
-
-# %%
-report.to_csv(f"{name}.csv")
-display(report)
-
 # %% [markdown]
 # ## Architettura 3
 # freeze immagine: false<br>
@@ -1136,7 +1111,6 @@ display(report)
 # batch size: 16<br>
 
 # %%
-name: str = "net3"
 net3: CLIP_SF = CLIP_SF(
     img_preprocess=preprocess,
     txt_preprocess=clip.tokenize,
@@ -1160,18 +1134,6 @@ net3: CLIP_SF = CLIP_SF(
     ),
 )
 
-# %%
-report: pd.DataFrame = training_loop(
-    name=name,
-    model=net3,
-    optimizer=lambda params: torch.optim.Adadelta(params=params, lr=15e-4, weight_decay=1e-6),
-    epochs=5,
-)
-
-# %%
-report.to_csv(f"{name}.csv")
-display(report)
-
 # %% [markdown]
 # ## Architettura 4
 # freeze immagine: false<br>
@@ -1185,7 +1147,6 @@ display(report)
 # batch size: 16<br>
 
 # %%
-name: str = "net4"
 net4: CLIP_SF = CLIP_SF(
     img_preprocess=preprocess,
     txt_preprocess=clip.tokenize,
@@ -1201,17 +1162,29 @@ net4: CLIP_SF = CLIP_SF(
     ),
 )
 
-# %%
-report: pd.DataFrame = training_loop(
-    name=name,
-    model=net4,
-    optimizer=lambda params: torch.optim.SGD(params=params, lr=1e-2, weight_decay=1e-6, momentum=.9),
-    epochs=5,
-)
+
+# %% [markdown]
+# Training
 
 # %%
-report.to_csv(f"{name}.csv")
-display(report)
+models: dict[str, tuple[torch.nn.Module, t.Callable[[t.Iterable[torch.Tensor]], torch.optim.Optimizer]]] = {
+    "net1": (net1, lambda params: torch.optim.SGD(params=params, lr=1e-2, weight_decay=1e-6, momentum=.9)),
+    "net2": (net2, lambda params: torch.optim.SGD(params=params, lr=1e-2, weight_decay=1e-6, momentum=.9)),
+    "net3": (net3, lambda params: torch.optim.Adadelta(params=params, lr=15e-4, weight_decay=1e-6)),
+    "net4": (net4, lambda params: torch.optim.SGD(params=params, lr=1e-2, weight_decay=1e-6, momentum=.9)),
+}
+
+# %%
+for name, (model, optimizer) in models.items():
+    report: pd.DataFrame = training_loop(name, model, optimizer)
+    report.to_csv(f"training-{name}.csv")
+
+# %% [markdown]
+# Storing
+
+# %%
+for name, (model, _) in models.items():
+    torch.save(obj=model.state_dict(), f=f"{name}.pth")
 
 
 # %% [markdown]
@@ -1233,20 +1206,13 @@ def compare(reports: dict[str, pd.DataFrame]) -> pd.DataFrame:
 
 
 # %%
-models: dict[str, torch.nn.Module] = {
-    "net1": net1,
-    "net2": net2,
-    "net3": net3,
-    "net4": net4,
-}
-
-reports: dict[str, pd.DataFrame] = {
-    k: eval_step(v, test_loader, preprocess) for k, v in models.items()
+eval_reports: dict[str, pd.DataFrame] = {
+    name: eval_step(model, test_loader, preprocess) for name, (model, _) in models.items()
 }
 
 # %%
-display(*[report.describe() for report in reports.values()])
+for name, report in eval_reports.items():
+    report.describe().to_csv(f"eval-{name}.csv")
 
 # %%
-cmp: pd.DataFrame = compare(reports)
-display(cmp)
+compare(eval_reports).to_csv("comparing.csv")
