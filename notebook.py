@@ -14,13 +14,14 @@ ftfy
 jaxtyping
 jupyter
 matplotlib
+pandas
 pydantic
 regex
-torch
-torchvision
-torchinfo
-tqdm
 tensorboard
+torch
+torchinfo
+torchvision
+tqdm
 END
 
 pip install -q -r requirements.txt
