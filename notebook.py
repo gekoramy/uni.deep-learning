@@ -41,25 +41,25 @@ pip install -q git+https://github.com/openai/CLIP.git
 # Dependences
 
 # %%
+import csv
 import doctest
-import clip
+import itertools as it
 import os
+import typing as t
+
+import clip
+import pandas as pd
 import torch
 import torch.nn as nn
-import torchvision
-import numpy as np
-import pandas as pd
-import itertools as it
-import typing as t
-import csv
 
 from collections import defaultdict
 from jaxtyping import Float, UInt, Int
 from pydantic.dataclasses import dataclass
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
-from torchvision.utils import draw_bounding_boxes
+from torchinfo import summary
 from torchvision.io import read_image, ImageReadMode
+from torchvision.ops import box_iou, box_convert
 from torchvision.transforms import (
     Compose,
     Resize,
@@ -69,9 +69,7 @@ from torchvision.transforms import (
     ConvertImageDtype,
 )
 from torchvision.transforms.functional import crop
-from torchinfo import summary
-from tqdm.notebook import tqdm, trange
-from torchvision.ops import box_iou, box_convert
+from tqdm.auto import tqdm, trange
 
 # %%
 device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
