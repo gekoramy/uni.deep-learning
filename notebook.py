@@ -265,9 +265,7 @@ class Coco4ClipDataset(Dataset[tuple[TensorImage, list[str]]]):
         file_name, sents, xyxy = self.items[index]
         img: TensorImage = read_image(file_name, ImageReadMode.RGB).to(device)
 
-        xywh: Int[torch.Tensor, "1 4"] = (
-            box_convert(xyxy, in_fmt="xyxy", out_fmt="xywh").round().int()
-        )
+        xywh: Int[torch.Tensor, "1 4"] = box_convert(xyxy, in_fmt="xyxy", out_fmt="xywh").round().int()
         [[x, y, w, h]] = xywh.tolist()
 
         return crop(img, top=y, left=x, height=h, width=w), sents
@@ -373,10 +371,7 @@ def transform(n_px: int) -> Compose:
             ConvertImageDtype(torch.float),
             Resize(n_px, interpolation=InterpolationMode.BICUBIC, antialias=True),
             CenterCrop(n_px),
-            Normalize(
-                (0.48145466, 0.4578275, 0.40821073),
-                (0.26862954, 0.26130258, 0.27577711),
-            ),
+            Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
         ]
     )
 
@@ -389,9 +384,7 @@ class ClipFlyp(nn.Module):
     def __init__(self):
         super().__init__()
         self.img_preprocess: Compose = preprocess
-        self.txt_preprocess: t.Callable[
-            [t.Union[str, list[str]]], Float[torch.Tensor, "77"]
-        ] = clip.tokenize
+        self.txt_preprocess: t.Callable[[t.Union[str, list[str]]], Float[torch.Tensor, "77"]] = clip.tokenize
         self.core = ClipFlypCore()
 
     def forward(
@@ -399,15 +392,17 @@ class ClipFlyp(nn.Module):
     ) -> Float[torch.Tensor, "entries"]:
         # step 1: preprocess crops as required by the visual encoder
         with torch.no_grad():
-            crops_preprocessed: Float[torch.Tensor, "entries 3 244 244"] = torch.stack(
-                [self.img_preprocess(crop) for crop, _ in entries]
-            )
+            crops_preprocessed: Float[torch.Tensor, "entries 3 244 244"] = torch.stack([
+                self.img_preprocess(crop)
+                for crop, _ in entries
+            ])
 
         # step 2: preprocess prompts as required by the text encoder
         with torch.no_grad():
-            prompts_preprocessed: Int[torch.Tensor, "entries 77"] = self.txt_preprocess(
-                [prompt for _, prompt in entries]
-            )
+            prompts_preprocessed: Int[torch.Tensor, "entries 77"] = self.txt_preprocess([
+                prompt
+                for _, prompt in entries
+            ])
 
         return self.core(crops_preprocessed, prompts_preprocessed)
 
@@ -421,22 +416,16 @@ class ClipLoss(nn.Module):
         logit_scale: Float[torch.Tensor, "1"],
     ) -> Float[torch.Tensor, "1"]:
         # compute logits per image and logits per text
-        logits_per_image: Float[torch.Tensor, "entries entries"] = (
-            logit_scale * imgs_features @ txts_features.T
-        )
-        logits_per_text: Float[torch.Tensor, "entries entries"] = (
-            logit_scale * txts_features @ imgs_features.T
-        )
+        logits_per_image: Float[torch.Tensor, "entries entries"] = logit_scale * imgs_features @ txts_features.T
+        logits_per_text: Float[torch.Tensor, "entries entries"] = logit_scale * txts_features @ imgs_features.T
 
         # get ground truth labels for the computation of the cross entropy loss
         labels: Int[torch.Tensor, "entries"] = torch.arange(logits_per_image.shape[0])
 
-        return torch.stack(
-            (
-                nn.functional.cross_entropy(logits_per_image, labels),
-                nn.functional.cross_entropy(logits_per_text, labels),
-            )
-        ).mean()
+        return torch.stack((
+            nn.functional.cross_entropy(logits_per_image, labels),
+            nn.functional.cross_entropy(logits_per_text, labels),
+        )).mean()
 
 
 # %%
@@ -471,9 +460,7 @@ def training_step(
         )
 
         # calculate loss
-        loss: Float[torch.Tensor, "1"] = loss_fn(
-            imgs_features, txts_features, logit_scale
-        )
+        loss: Float[torch.Tensor, "1"] = loss_fn(imgs_features, txts_features, logit_scale)
         running_loss += loss.item()
 
         # optimizer zero grad
@@ -515,9 +502,7 @@ def test_step(
             )
 
             # calculate loss
-            loss: Float[torch.Tensor, "1"] = loss_fn(
-                imgs_features, txts_features, logit_scale
-            )
+            loss: Float[torch.Tensor, "1"] = loss_fn(imgs_features, txts_features, logit_scale)
             running_loss += loss.item()
 
             progress.set_postfix({"loss": running_loss / iter}, refresh=False)
@@ -546,15 +531,9 @@ def training_showtime(
                 [(img, prompts[0]) for img, prompts in entries]
             )
 
-            imgs_features: Float[
-                torch.Tensor, "entries 1024"
-            ] = imgs_features / imgs_features.norm(dim=-1, keepdim=True)
-            txts_features: Float[
-                torch.Tensor, "entries 1024"
-            ] = txts_features / txts_features.norm(dim=-1, keepdim=True)
-            similarity: Float[torch.Tensor, "entries entries"] = (
-                txts_features @ imgs_features.T
-            )
+            imgs_features: Float[torch.Tensor, "entries 1024"] = imgs_features / imgs_features.norm(dim=-1, keepdim=True)
+            txts_features: Float[torch.Tensor, "entries 1024"] = txts_features / txts_features.norm(dim=-1, keepdim=True)
+            similarity: Float[torch.Tensor, "entries entries"] = txts_features @ imgs_features.T
 
             f: plt.Figure
             ax: plt.Axes
@@ -651,7 +630,12 @@ def training_loop(
         loss["test"].append(test_loss)
         loss["val"].append(val_loss)
 
-        training_showtime(model, training_showtime_dataloader, writer, 0)
+        training_showtime(
+            model=model,
+            data_loader=training_showtime_dataloader,
+            writer=writer,
+            global_step=0,
+        )
 
         # log to TensorBoard
         writer.add_scalars(
@@ -707,7 +691,12 @@ def training_loop(
 
         loss["test"].append(test_loss)
 
-        training_showtime(model, training_showtime_dataloader, writer, EPOCHS)
+        training_showtime(
+            model=model,
+            data_loader=training_showtime_dataloader,
+            writer=writer,
+            global_step=EPOCHS,
+        )
 
         # log to TensorBoard
         writer.add_scalars(
@@ -738,11 +727,9 @@ model: ClipFlyp = ClipFlyp().to(device)
 
 # %%
 report: pd.DataFrame = training_loop(
-    name,
-    model,
-    lambda params: torch.optim.SGD(
-        params=params, lr=1e-2, weight_decay=1e-6, momentum=0.9
-    ),
+    name=name,
+    model=model,
+    optimizer=lambda params: torch.optim.SGD(params=params, lr=1e-2, weight_decay=1e-6, momentum=0.9),
 )
 report.to_csv(f"training-{name}.csv")
 
@@ -774,12 +761,8 @@ class ClipFlypEvalCore(nn.Module):
         prompts_z: Float[torch.Tensor, "prompts 1024"],
     ) -> Float[torch.Tensor, "prompts crops"]:
         # normalise the image and the text
-        crops_z: Float[torch.Tensor, "crops 1024"] = crops_z / crops_z.norm(
-            dim=-1, keepdim=True
-        )
-        prompts_z: Float[torch.Tensor, "prompts 1024"] = prompts_z / prompts_z.norm(
-            dim=-1, keepdim=True
-        )
+        crops_z: Float[torch.Tensor, "crops 1024"] = crops_z / crops_z.norm(dim=-1, keepdim=True)
+        prompts_z: Float[torch.Tensor, "prompts 1024"] = prompts_z / prompts_z.norm(dim=-1, keepdim=True)
 
         # evaluate the cosine similarity between the sets of features
         return prompts_z @ crops_z.T
@@ -796,9 +779,7 @@ class ClipFlypEvalCore(nn.Module):
         prompt_z: Int[torch.Tensor, "prompts 1024"] = self.txt_encoder(prompts)
 
         # step 3: evaluate logits
-        similarity_matrix: Float[
-            torch.Tensor, "prompts crops"
-        ] = self.cosine_similarity(crop_z, prompt_z)
+        similarity_matrix: Float[torch.Tensor, "prompts crops"] = self.cosine_similarity(crop_z, prompt_z)
 
         # step 4: crops classification
         return torch.mean(similarity_matrix, dim=0)
@@ -813,9 +794,7 @@ class ClipFlypEval(nn.Module):
     ):
         super().__init__()
         self.img_preprocess: Compose = preprocess
-        self.txt_preprocess: t.Callable[
-            [t.Union[str, list[str]]], Float[torch.Tensor, "77"]
-        ] = clip.tokenize
+        self.txt_preprocess: t.Callable[[t.Union[str, list[str]]], Float[torch.Tensor, "77"]] = clip.tokenize
         self.core = ClipFlypEvalCore(img_encoder, txt_encoder)
 
     def forward(
@@ -823,15 +802,14 @@ class ClipFlypEval(nn.Module):
     ) -> Float[torch.Tensor, "crops 1"]:
         # step 1: preprocess crops as required by the visual encoder
         with torch.no_grad():
-            crops_preprocessed: Float[torch.Tensor, "crops 3 244 244"] = torch.stack(
-                [self.img_preprocess(crop) for crop in crops]
-            )
+            crops_preprocessed: Float[torch.Tensor, "crops 3 244 244"] = torch.stack([
+                self.img_preprocess(crop)
+                for crop in crops
+            ])
 
         # step 2: preprocess prompts as required by the text encoder
         with torch.no_grad():
-            prompts_preprocessed: Int[torch.Tensor, "prompts 77"] = self.txt_preprocess(
-                prompts
-            )
+            prompts_preprocessed: Int[torch.Tensor, "prompts 77"] = self.txt_preprocess(prompts)
 
         return self.core(crops_preprocessed, prompts_preprocessed)
 
@@ -883,9 +861,7 @@ def showtime(
             true_i: int = best_bbox(xyxys, true_xyxy)
 
             # from xyxys to crops
-            xywhs: Int[torch.Tensor, "X 4"] = (
-                box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").round().int()
-            )
+            xywhs: Int[torch.Tensor, "X 4"] = box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").round().int()
 
             crops: list[TensorImage] = [
                 crop(img, top=y, left=x, height=h, width=w)
@@ -906,9 +882,7 @@ def showtime(
             writer.add_image_with_boxes(
                 tag=f"{iter}: {' ¶ '.join(prompts)}",
                 img_tensor=img,
-                box_tensor=torch.stack(
-                    (xyxys[pred_i], xyxys[true_i], true_xyxy.squeeze())
-                ),
+                box_tensor=torch.stack((xyxys[pred_i], xyxys[true_i], true_xyxy.squeeze())),
                 labels=["prediction", "best region proposal", "ground truth"],
                 global_step=global_step,
             )
@@ -942,9 +916,7 @@ def eval_step(
             true_i: int = best_bbox(xyxys, true_xyxy)
 
             # from xyxys to crops
-            xywhs: Int[torch.Tensor, "X 4"] = (
-                box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").round().int()
-            )
+            xywhs: Int[torch.Tensor, "X 4"] = box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").round().int()
 
             crops: list[TensorImage] = [
                 crop(img, top=y, left=x, height=h, width=w)
@@ -953,9 +925,7 @@ def eval_step(
             ]
 
             # from true_xyxy to true_crop
-            true_xywh: Int[torch.Tensor, "1 4"] = (
-                box_convert(true_xyxy, in_fmt="xyxy", out_fmt="xywh").round().int()
-            )
+            true_xywh: Int[torch.Tensor, "1 4"] = box_convert(true_xyxy, in_fmt="xyxy", out_fmt="xywh").round().int()
 
             true_crop: TensorImage
             [true_crop] = [
@@ -1002,18 +972,9 @@ def eval_step(
 def compare(reports: dict[str, pd.DataFrame]) -> pd.DataFrame:
     return pd.DataFrame(
         {
-            "mA[IoU .3]": [
-                (report["iou"] >= 0.3).sum() / report["iou"].count()
-                for report in reports.values()
-            ],
-            "mA[IoU .5]": [
-                (report["iou"] >= 0.5).sum() / report["iou"].count()
-                for report in reports.values()
-            ],
-            "mA[IoU .7]": [
-                (report["iou"] >= 0.7).sum() / report["iou"].count()
-                for report in reports.values()
-            ],
+            "mA[IoU .3]": [(report["iou"] >= 0.3).sum() / report["iou"].count() for report in reports.values()],
+            "mA[IoU .5]": [(report["iou"] >= 0.5).sum() / report["iou"].count() for report in reports.values()],
+            "mA[IoU .7]": [(report["iou"] >= 0.7).sum() / report["iou"].count() for report in reports.values()],
             "mIoU": [report["iou"].mean() for report in reports.values()],
             "mCos": [report["cos similarity"].mean() for report in reports.values()],
             "mED": [report["euclidean distance"].mean() for report in reports.values()],
