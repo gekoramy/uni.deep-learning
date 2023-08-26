@@ -343,16 +343,6 @@ class ClipFlypCore(nn.Module):
 
 
 # %%
-with SummaryWriter() as writer:
-    writer.add_graph(
-        model=ClipFlypCore(),
-        input_to_model=[
-            torch.ones((8, 3, 244, 244), dtype=torch.float),
-            torch.ones((8, 77), dtype=torch.int),
-        ],
-    )
-
-# %%
 summary(
     ClipFlypCore(),
     input_size=[(8, 3, 244, 244), (8, 77)],
