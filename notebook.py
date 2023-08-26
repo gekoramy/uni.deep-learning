@@ -641,7 +641,7 @@ def training_loop(
         for epoch in progress:
             train_loss = training_step(
                 model=model,
-                data_loader=split2loader["test"],
+                data_loader=split2loader["train"],
                 optimizer=optimizer(model.parameters()),
             )
 
