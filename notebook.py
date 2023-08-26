@@ -347,8 +347,8 @@ with SummaryWriter() as writer:
     writer.add_graph(
         model=ClipFlypCore(),
         input_to_model=[
-            torch.ones((5, 3, 244, 244)),
-            torch.ones((2, 77), dtype=torch.int),
+            torch.ones((8, 3, 244, 244), dtype=torch.float),
+            torch.ones((8, 77), dtype=torch.int),
         ],
     )
 
@@ -533,7 +533,7 @@ def training_showtime(
 
             imgs_features: Float[torch.Tensor, "entries 1024"] = imgs_features / imgs_features.norm(dim=-1, keepdim=True)
             txts_features: Float[torch.Tensor, "entries 1024"] = txts_features / txts_features.norm(dim=-1, keepdim=True)
-            similarity: Float[torch.Tensor, "entries entries"] = txts_features @ imgs_features.T
+            similarity: Float[torch.Tensor, "entries entries"] = (txts_features @ imgs_features.T).cpu()
 
             f: plt.Figure
             ax: plt.Axes
@@ -550,7 +550,7 @@ def training_showtime(
 
             for i, image in enumerate([crop for crop, _ in entries]):
                 ax.imshow(
-                    image.permute(1, 2, 0),
+                    image.permute(1, 2, 0).cpu(),
                     extent=(i - 0.5, i + 0.5, -1.6, -0.6),
                     origin="lower",
                 )
