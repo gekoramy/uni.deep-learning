@@ -144,9 +144,7 @@ with open(path_sentences, "r") as f:
     sentences: list[Sentence] = [Sentence(**row) for row in raw]
 
 
-id2sents: dict[int, list[str]] = groupby(
-    sentences, lambda x: x.ref_id, lambda x: x.sent
-)
+id2sents: dict[int, list[str]] = groupby(sentences, lambda x: x.ref_id, lambda x: x.sent)
 
 
 # %%
@@ -215,15 +213,13 @@ class CocoDataset(
             for sents in [id2sents[ref.ref_id]]
             for bboxes in [img2bboxes[ref.file_name]]
             for xyxys in [
-                torch.tensor(
-                    [
-                        (bbox.xmin, bbox.ymin, bbox.xmax, bbox.ymax)
-                        for bbox in bboxes
-                        if bbox.confidence > 0.25  # lower bound on confidence
-                        if bbox.xmax - bbox.xmin > 16  # lower limit on width
-                        if bbox.ymax - bbox.ymin > 16  # lower limit on heigth
-                    ]
-                )
+                torch.tensor([
+                    (bbox.xmin, bbox.ymin, bbox.xmax, bbox.ymax)
+                    for bbox in bboxes
+                    if bbox.confidence > 0.25  # lower bound on confidence
+                    if bbox.xmax - bbox.xmin > 16  # lower limit on width
+                    if bbox.ymax - bbox.ymin > 16  # lower limit on heigth
+                ])
             ]
             for xyxy in [torch.tensor([(ref.xmin, ref.ymin, ref.xmax, ref.ymax)])]
         ]
@@ -275,15 +271,13 @@ class CocoTrainDataset(
             for sents in [id2sents[ref.ref_id]]
             for bboxes in [img2bboxes[ref.file_name]]
             for xyxys in [
-                torch.tensor(
-                    [
-                        (bbox.xmin, bbox.ymin, bbox.xmax, bbox.ymax)
-                        for bbox in bboxes
-                        if bbox.confidence > 0.25  # lower bound on confidence
-                        if bbox.xmax - bbox.xmin > 16  # lower limit on width
-                        if bbox.ymax - bbox.ymin > 16  # lower limit on heigth
-                    ]
-                )
+                torch.tensor([
+                    (bbox.xmin, bbox.ymin, bbox.xmax, bbox.ymax)
+                    for bbox in bboxes
+                    if bbox.confidence > 0.25  # lower bound on confidence
+                    if bbox.xmax - bbox.xmin > 16  # lower limit on width
+                    if bbox.ymax - bbox.ymin > 16  # lower limit on heigth
+                ])
             ]
             if xyxys.shape[1] > 1  # lower bound on # of bboxes per image
             for xyxy in [torch.tensor([(ref.xmin, ref.ymin, ref.xmax, ref.ymax)])]
@@ -308,9 +302,7 @@ class CocoTrainDataset(
         file_name, sents, i, xyxys, xyxy = self.items[index]
         img: TensorImage = read_image(file_name, ImageReadMode.RGB).to(device)
 
-        xywhs: Int[torch.Tensor, "X 4"] = (
-            box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").round().int()
-        )
+        xywhs: Int[torch.Tensor, "X 4"] = box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").round().int()
 
         crops: list[TensorImage] = [
             crop(img, top=y, left=x, height=h, width=w)
@@ -320,14 +312,6 @@ class CocoTrainDataset(
 
         return crops, sents, i, xyxys, xyxy
 
-
-# %%
-import matplotlib.pyplot as plt
-
-for _, (crops, _, _, _, _) in zip(range(5), CocoTrainDataset("test", img2detr)):
-    for c in crops:
-        plt.imshow(c.permute(1, 2, 0).cpu())
-        plt.show(block=True)
 
 # %% [markdown]
 # # Attention is all you need
@@ -346,17 +330,12 @@ def transform(n_px: int) -> Compose:
     """
     https://github.com/openai/CLIP/blob/a1d071733d7111c9c014f024669f959182114e33/clip/clip.py#L75-L86
     """
-    return Compose(
-        [
-            ConvertImageDtype(torch.float),
-            Resize(n_px, interpolation=InterpolationMode.BICUBIC, antialias=True),
-            CenterCrop(n_px),
-            Normalize(
-                (0.48145466, 0.4578275, 0.40821073),
-                (0.26862954, 0.26130258, 0.27577711),
-            ),
-        ]
-    )
+    return Compose([
+        ConvertImageDtype(torch.float),
+        Resize(n_px, interpolation=InterpolationMode.BICUBIC, antialias=True),
+        CenterCrop(n_px),
+        Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
+    ])
 
 
 preprocess: Compose = transform(224)
@@ -402,9 +381,7 @@ class ClipContexCore(nn.Module):
         prompts_z: Float[torch.Tensor, "prompts 1024"],
     ) -> tuple[Float[torch.Tensor, "crops 1024"], Float[torch.Tensor, "prompts 1024"]]:
         # concatenate image embeedings and prompt embeedings in the same latent context
-        concat: Float[torch.Tensor, "crops+prompts 1024"] = torch.cat(
-            (crops_z, prompts_z), dim=0
-        )
+        concat: Float[torch.Tensor, "crops+prompts 1024"] = torch.cat((crops_z, prompts_z), dim=0)
 
         contextualized: Float[torch.Tensor, "crops+prompts 1024"]
         contextualized, _ = self.attention(concat, concat, concat)
@@ -418,12 +395,8 @@ class ClipContexCore(nn.Module):
         prompts_z: Float[torch.Tensor, "prompts 1024"],
     ) -> Float[torch.Tensor, "prompts crops"]:
         # normalise the image and the text
-        crops_z: Float[torch.Tensor, "crops 1024"] = crops_z / crops_z.norm(
-            dim=-1, keepdim=True
-        )
-        prompts_z: Float[torch.Tensor, "prompts 1024"] = prompts_z / prompts_z.norm(
-            dim=-1, keepdim=True
-        )
+        crops_z: Float[torch.Tensor, "crops 1024"] = crops_z / crops_z.norm(dim=-1, keepdim=True)
+        prompts_z: Float[torch.Tensor, "prompts 1024"] = prompts_z / prompts_z.norm(dim=-1, keepdim=True)
 
         # evaluate the cosine similarity between the sets of features
         return prompts_z @ crops_z.T
@@ -445,9 +418,7 @@ class ClipContexCore(nn.Module):
         crop_context_z, prompt_context_z = self.contextualize(crops_z, prompts_z)
 
         # step 4: evaluate logits
-        similarity_matrix: Float[
-            torch.Tensor, "prompts crops"
-        ] = self.cosine_similarity(crop_context_z, prompt_context_z)
+        similarity_matrix: Float[torch.Tensor, "prompts crops"] = self.cosine_similarity(crop_context_z, prompt_context_z)
 
         # step 5: crops classification
         return torch.mean(similarity_matrix, dim=0)
@@ -464,18 +435,17 @@ class ClipContex(nn.Module):
         self.core = ClipContexCore(img_encoder, txt_encoder)
 
         self.img_preprocess: Compose = preprocess
-        self.txt_preprocess: t.Callable[
-            [t.Union[str, list[str]]], Float[torch.Tensor, "77"]
-        ] = clip.tokenize
+        self.txt_preprocess: t.Callable[[t.Union[str, list[str]]], Float[torch.Tensor, "77"]] = clip.tokenize
 
     def forward(
         self, crops: list[TensorImage], prompts: list[str]
     ) -> Float[torch.Tensor, "crops 1"]:
         # step 1: preprocess crops as required by the visual encoder
         with torch.no_grad():
-            crops_preprocessed: Float[torch.Tensor, "crops 3 244 244"] = torch.stack(
-                [self.img_preprocess(crop) for crop in crops]
-            )
+            crops_preprocessed: Float[torch.Tensor, "crops 3 244 244"] = torch.stack([
+                self.img_preprocess(crop)
+                for crop in crops
+            ])
 
         # step 2: preprocess prompts as required by the text encoder
         with torch.no_grad():
@@ -585,12 +555,10 @@ def training_step(
         ]
 
         # calculate loss
-        losses: Float[torch.Tensor, "batch"] = torch.stack(
-            [
-                loss_fn(pred, torch.tensor(true_i))
-                for pred, true_i in zip(preds, true_is)
-            ]
-        )
+        losses: Float[torch.Tensor, "batch"] = torch.stack([
+            loss_fn(pred, torch.tensor(true_i))
+            for pred, true_i in zip(preds, true_is)
+        ])
         loss: Float[torch.Tensor, "1"] = torch.mean(losses)
         running_loss += loss.item()
 
@@ -599,11 +567,6 @@ def training_step(
 
         # loss backward
         loss.backward()
-
-        for name, param in model.named_parameters():
-            if param.grad is not None:
-                gradient_norm = torch.norm(param.grad)
-                print(f"Parameter: {name}, Gradient Norm: {gradient_norm}")
 
         # optimizer step
         optimizer.step()
@@ -615,13 +578,12 @@ def training_step(
 
             # # get predicted bounding boxes
             pred_xyxys: list[Float[torch.Tensor, "4"]] = [
-                xyxys[pred_i] for xyxys, pred_i in zip(xyxyss, pred_is)
+                xyxys[pred_i]
+                for xyxys, pred_i in zip(xyxyss, pred_is)
             ]
 
-            # # IoU
-            acc: float = torch.mean(
-                box_iou(torch.cat(true_xyxys), torch.stack(pred_xyxys)).diagonal()
-            ).item()
+            # # IoU
+            acc: float = torch.mean(box_iou(torch.cat(true_xyxys), torch.stack(pred_xyxys)).diagonal()).item()
             running_acc += acc
 
             progress.set_postfix(
@@ -660,9 +622,7 @@ def test_step(
             true_i: int = best_bbox(xyxys, true_xyxy)
 
             # from xyxys to crops
-            xywhs: Int[torch.Tensor, "X 4"] = (
-                box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").round().int()
-            )
+            xywhs: Int[torch.Tensor, "X 4"] = box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").round().int()
 
             crops: list[TensorImage] = [
                 crop(img, top=y, left=x, height=h, width=w)
@@ -725,9 +685,7 @@ def showtime(
             true_i: int = best_bbox(xyxys, true_xyxy)
 
             # from xyxys to crops
-            xywhs: Int[torch.Tensor, "X 4"] = (
-                box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").round().int()
-            )
+            xywhs: Int[torch.Tensor, "X 4"] = box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").round().int()
 
             crops: list[TensorImage] = [
                 crop(img, top=y, left=x, height=h, width=w)
@@ -784,9 +742,7 @@ def eval_step(
             true_i: int = best_bbox(xyxys, true_xyxy)
 
             # from xyxys to crops
-            xywhs: Int[torch.Tensor, "X 4"] = (
-                box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").round().int()
-            )
+            xywhs: Int[torch.Tensor, "X 4"] = box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").round().int()
 
             crops: list[TensorImage] = [
                 crop(img, top=y, left=x, height=h, width=w)
@@ -795,9 +751,7 @@ def eval_step(
             ]
 
             # from true_xyxy to true_crop
-            true_xywh: Int[torch.Tensor, "1 4"] = (
-                box_convert(true_xyxy, in_fmt="xyxy", out_fmt="xywh").round().int()
-            )
+            true_xywh: Int[torch.Tensor, "1 4"] = box_convert(true_xyxy, in_fmt="xyxy", out_fmt="xywh").round().int()
 
             true_crop: TensorImage
             [true_crop] = [
@@ -998,7 +952,7 @@ def training_loop(
             )
 
             # store model
-            torch.save(obj=model.state_dict(), f=f"{name}-{epoch + 1}.pth")
+            torch.save(obj=model.state_dict(), f=f"{name}-{(epoch + 1):02d}.pth")
 
         # compute final evaluation results
         print("After training:")
@@ -1072,9 +1026,7 @@ model: ClipContex = ClipContex(
 report: pd.DataFrame = training_loop(
     name,
     model,
-    lambda params: torch.optim.SGD(
-        params=params, lr=0.01, weight_decay=1e-6, momentum=0.9
-    ),
+    lambda params: torch.optim.SGD(params=params, lr=0.01, weight_decay=1e-6, momentum=0.9),
 )
 report.to_csv(f"training-{name}.csv")
 
