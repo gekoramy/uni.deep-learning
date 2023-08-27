@@ -1,5 +1,11 @@
-# %% [markdown]
-# <a href="https://colab.research.google.com/github/gekoramy/uni.deep-learning/blob/attention/notebook.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
+# %%
+# %%shell
+if ! [ -d dataset ]; then
+  mkdir dataset &&
+  gdown 1i-LHWSRp2F6--yhAi4IG3DiiCHmgE4cw &&
+  tar -xf refcocog.tar -C dataset &&
+  rm refcocog.tar
+fi
 
 # %%
 # %%shell
@@ -8,276 +14,218 @@ ftfy
 jaxtyping
 jupyter
 matplotlib
+pandas
 pydantic
 regex
+tensorboard
 torch
 torchinfo
 torchvision
 tqdm
-ultralytics
 END
 
 pip install -q -r requirements.txt
 pip install -q git+https://github.com/openai/CLIP.git
 
 # %%
-import clip
-import json
-import os
-import pickle
-import re
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torchvision
-import numpy as np
-import PIL
-import itertools as it
-import math
-
-from datetime import datetime
-from jaxtyping import Float, UInt, Int
-from pydantic.dataclasses import dataclass
-from torch.utils.data import DataLoader
-from torch.utils.data import Dataset
-from torchvision import transforms
-from torchvision.utils import draw_bounding_boxes
-from torchvision.io import read_image
-from torchinfo import summary
-from typing import Literal, Callable, Mapping, TypeVar
-from tqdm import tqdm
-from timeit import default_timer as timer
-from torch.utils.tensorboard import SummaryWriter
+# %load_ext tensorboard
 
 # %%
-device: Literal["cpu", "cuda"] = "cuda" if torch.cuda.is_available() else "cpu"
-torch.set_default_device(device)
-device
+# %tensorboard --logdir ./runs
 
+# %%
+import csv
+import doctest
+import itertools as it
+import os
+import typing as t
+
+import clip
+import pandas as pd
+import torch
+import torch.nn as nn
+
+from collections import defaultdict
+from jaxtyping import Float, UInt, Int
+from pydantic.dataclasses import dataclass
+from torch.utils.data import DataLoader, Dataset
+from torch.utils.tensorboard import SummaryWriter
+from torchinfo import summary
+from torchvision.io import read_image, ImageReadMode
+from torchvision.ops import box_iou, box_convert
+from torchvision.transforms import (
+    Compose,
+    Resize,
+    CenterCrop,
+    Normalize,
+    InterpolationMode,
+    ConvertImageDtype,
+)
+from torchvision.transforms.functional import crop
+from tqdm.auto import tqdm, trange
+
+# %%
+device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.set_default_device(device)
+
+# %%
+# setting a manual seed allow us to provide reprudicible results in this notebook
+# https://pytorch.org/docs/stable/notes/randomness.html
+
+torch.manual_seed(42)
+torch.cuda.manual_seed_all(42)
+torch.use_deterministic_algorithms(False)  # CLIP uses non-deterministic algorithms
+g: torch.Generator = torch.Generator(device=device).manual_seed(42)
 
 # %% [markdown]
 # ### Utils
-
-# %%
-def print_train_time(start: float, end: float, device: torch.device = None):
-    """Prints difference between start and end time.
-
-    Args:
-        start (float): Start time of computation (preferred in timeit format).
-        end (float): End time of computation.
-        device ([type], optional): Device that compute is running on. Defaults to None.
-
-    Returns:
-        float: time between start and end in seconds (higher is longer).
-    """
-    total_time = end - start
-    print(f"Train time on {device}: {total_time:.3f} seconds")
-    return total_time
-
-
-# %%
-# args:
-#  - predictionList: [Prediction]
-#  - numPred: int :: if numPred==-1 (default) consider all the predictions in predictionList
-def display_predictions(predictionList, numPred=-1):
-    limit = 0
-    for p in predictionList:
-        if numPred != -1 and limit >= numPred:
-            return
-        limit += 1
-
-        p_image = p.image
-
-        if not isinstance(p_image, torch.Tensor):
-            p_image = torchvision.transforms.PILToTensor()(p_image)
-
-        p_description = p.description
-        p_ground_truth_bbox = p.ground_truth_bbox
-        p_output_bbox = p.output_bbox
-
-        # TODO: concatenate
-        p_image = draw_bounding_boxes(
-            p_image, p_ground_truth_bbox.unsqueeze(0), colors="green", width=5
-        )
-        p_image = draw_bounding_boxes(
-            p_image, p_output_bbox.unsqueeze(0), colors="red", width=5
-        )
-
-        tensor_to_pil = transforms.ToPILImage()
-        image_pil = tensor_to_pil(p_image)
-        display(image_pil)
-        print(p_description)
-        print("\n\n")
-
 
 # %% [markdown]
 # #### Dataset and type declaration
 
 # %%
-# %%shell
-if ! [ -d dataset ]; then
-  mkdir dataset &&
-  gdown 1P8a1g76lDJ8cMIXjNDdboaRR5-HsVmUb &&
-  tar -xf refcocog.tar.gz -C dataset &&
-  rm refcocog.tar.gz
-fi
+path_root: str = os.path.join("dataset", "refcocog", "")
+path_annotations: str = os.path.join(path_root, "annotations", "")
+path_bboxes: str = os.path.join(path_root, "bboxes", "")
+path_images: str = os.path.join(path_root, "images", "")
+
+path_refs: str = os.path.join(path_annotations, "refs.csv")
+path_sentences: str = os.path.join(path_annotations, "sentences.csv")
+
+path_DETR: str = os.path.join(path_bboxes, "bboxes[DETR].csv")
+path_YOLOv5: str = os.path.join(path_bboxes, "bboxes[YOLOv5].csv")
+path_YOLOv8: str = os.path.join(path_bboxes, "bboxes[YOLOv8].csv")
 
 # %%
-root = os.path.join("dataset", "refcocog", "")
-data_instances = os.path.join(root, "annotations", "instances.json")
-data_refs = os.path.join(root, "annotations", "refs(umd).p")
-data_images = os.path.join(root, "images", "")
-
-# %%
-I = TypeVar("I")
-P = TypeVar("P")
-B = TypeVar("B")
-T = TypeVar("T")
-
-Img = UInt[torch.Tensor, "C W H"]
-BBox = UInt[torch.Tensor, "4"]
-Split = Literal["train", "test", "val"]
-
-
-@dataclass
-class Info:
-    description: str  # This is stable 1.0 version of the 2014 MS COCO dataset.
-    url: str  # http://mscoco.org/
-    version: str  # 1.0
-    year: int  # 2014
-    contributor: str  # Microsoft COCO group
-    date_created: datetime  # 2015-01-27 09:11:52.357475
-
-
-@dataclass
-class Image:
-    license: int  # each image has an associated licence id
-    file_name: str  # file name of the image
-    coco_url: str  # example http://mscoco.org/images/131074
-    height: int
-    width: int
-    flickr_url: str  # example http://farm9.staticflickr.com/8308/7908210548_33e
-    id: int  # id of the imag
-    date_captured: datetime  # example '2013-11-21 01:03:06'
-
-
-@dataclass
-class License:
-    url: str  # example http://creativecommons.org/licenses/by-nc-sa/2.0/
-    id: int  # id of the licence
-    name: str  # example 'Attribution-NonCommercial-ShareAlike License
-
-
-@dataclass
-class Annotation:
-    # segmentation: list[list[float]]  # description of the mask; example [[44.17, 217.83, 36.21, 219.37, 33.64, 214.49, 31.08, 204.74, 36.47, 202.68, 44.17, 203.2]]
-    area: float  # number of pixel of the described object
-    iscrowd: Literal[
-        1, 0
-    ]  # Crowd annotations (iscrowd=1) are used to label large groups of objects (e.g. a crowd of people)
-    image_id: int  # id of the target image
-    bbox: tuple[
-        float, float, float, float
-    ]  # bounding box coordinates [xmin, ymin, width, height]
-    category_id: int
-    id: int  # annotation id
-
-
-@dataclass
-class Category:
-    supercategory: str  # example 'vehicle'
-    id: int  # category id
-    name: str  # example 'airplane'
-
-
-@dataclass
-class Instances:
-    info: Info
-    images: list[Image]
-    licenses: list[License]
-    annotations: list[Annotation]
-    categories: list[Category]
-
-
-@dataclass
-class Sentence:
-    tokens: list[str]  # tokenized version of referring expression
-    raw: str  # unprocessed referring expression
-    sent: str  # referring expression with mild processing, lower case, spell correction, etc.
-    sent_id: int  # unique referring expression id
+Split = t.Literal["train", "test", "val"]
 
 
 @dataclass
 class Ref:
-    image_id: int  # unique image id
-    split: Split
-    sentences: list[Sentence]
-    file_name: str  # file name of image relative to img_root
-    category_id: int  # object category label
-    ann_id: int  # id of object annotation in instance.json
-    sent_ids: list[int]  # same ids as nested sentences[...][sent_id]
     ref_id: int  # unique id for refering expression
+    file_name: str  # file name of image relative to img_root
+    split: Split
+    xmin: float
+    ymin: float
+    xmax: float
+    ymax: float
+
+
+with open(path_refs, "r") as f:
+    raw = csv.DictReader(f)
+    refs: list[Ref] = [Ref(**row) for row in raw]
+
+# %%
+T = t.TypeVar("T")
+K = t.TypeVar("K")
+V = t.TypeVar("V")
+
+
+def groupby(
+    xs: list[T],
+    map_key: t.Callable[[T], K],
+    map_value: t.Callable[[T], V] = lambda x: x,
+) -> dict[K, list[V]]:
+    return {
+        k: [map_value(v) for v in vs]
+        for k, vs in it.groupby(sorted(xs, key=map_key), key=map_key)
+    }
 
 
 # %%
-class Prediction:
-    def __init__(self, image, description, ground_truth_bbox, output_bbox):
-        self.image = image
-        self.description = description
-        self.ground_truth_bbox = ground_truth_bbox
-        self.output_bbox = output_bbox
+@dataclass
+class Sentence:
+    ref_id: int  # unique id for refering expression
+    sent: str
+
+
+with open(path_sentences, "r") as f:
+    raw = csv.DictReader(f)
+    sentences: list[Sentence] = [Sentence(**row) for row in raw]
+
+
+id2sents: dict[int, list[str]] = groupby(
+    sentences, lambda x: x.ref_id, lambda x: x.sent
+)
 
 
 # %%
-def fix_ref(x: Ref) -> Ref:
-    x.file_name = fix_filename(x.file_name)
-    return x
+@dataclass
+class BBox:
+    file_name: str  # file name of image relative to img_root
+    xmin: float
+    ymin: float
+    xmax: float
+    ymax: float
+    confidence: float
 
 
-def fix_filename(x: str) -> str:
-    """
-    :param x: COCO_..._[image_id]_[annotation_id].jpg
-    :return:  COCO_..._[image_id].jpg
+with open(path_DETR, "r") as f:
+    raw = csv.DictReader(f)
+    bboxes: list[BBox] = [BBox(**row) for row in raw]
 
-    >>> fix_filename('COCO_..._[image_id]_0000000001.jpg')
-    'COCO_..._[image_id].jpg'
+img2detr: dict[str, list[BBox]] = defaultdict(
+    list, groupby(bboxes, lambda x: x.file_name)
+)
 
-    """
-    return re.sub("_\d+\.jpg$", ".jpg", x)
 
+with open(path_YOLOv5, "r") as f:
+    raw = csv.DictReader(f)
+    bboxes: list[BBox] = [BBox(**row) for row in raw]
+
+img2yolov5: dict[str, list[BBox]] = defaultdict(
+    list, groupby(bboxes, lambda x: x.file_name)
+)
+
+
+with open(path_YOLOv8, "r") as f:
+    raw = csv.DictReader(f)
+    bboxes: list[BBox] = [BBox(**row) for row in raw]
+
+img2yolov8: dict[str, list[BBox]] = defaultdict(
+    list, groupby(bboxes, lambda x: x.file_name)
+)
 
 # %%
-with open(data_refs, "rb") as f:
-    raw = pickle.load(f)
-
-refs: list[Ref] = [fix_ref(Ref(**ref)) for ref in raw]
-
-# %%
-with open(data_instances, "r") as f:
-    raw = json.load(f)
-
-instances: Instances = Instances(**raw)
-
-id2annotation: Mapping[int, Annotation] = {x.id: x for x in instances.annotations}
+TensorImage = UInt[torch.Tensor, "3 H W"]
 
 
-# %%
-class CocoDataset(Dataset[tuple[PIL.Image, list[str], Float[torch.Tensor, "4"]]]):
+class CocoDataset(
+    Dataset[
+        tuple[
+            TensorImage, list[str], Float[torch.Tensor, "X 4"], Float[torch.Tensor, "4"]
+        ]
+    ]
+):
     def __init__(
         self,
         split: Split,
+        img2bboxes: dict[str, list[BBox]],
         limit: int = -1,
     ):
-        self.__init__
-        self.items: list[tuple[str, list[str], Float[torch.Tensor, "4"]]] = [
-            (i, [s.sent for s in ss], xywh)
+        self.items: list[
+            tuple[
+                str, list[str], Float[torch.Tensor, "X 5"], Float[torch.Tensor, "1 4"]
+            ]
+        ] = [
+            (img, sents, xyxys, xyxy)
             for ref in refs
             if ref.split == split
-            for i in [os.path.join(data_images, ref.file_name)]
-            for ss in [ref.sentences]
-            for xywh in [
-                torch.tensor(id2annotation[ref.ann_id].bbox, dtype=torch.float)
+            for img in [os.path.join(path_images, ref.file_name)]
+            for sents in [id2sents[ref.ref_id]]
+            for bboxes in [img2bboxes[ref.file_name]]
+            for xyxys in [
+                torch.tensor(
+                    [
+                        (bbox.xmin, bbox.ymin, bbox.xmax, bbox.ymax)
+                        for bbox in bboxes
+                        if bbox.confidence > 0.25  # lower bound on confidence
+                        if bbox.xmax - bbox.xmin > 16  # lower limit on width
+                        if bbox.ymax - bbox.ymin > 16  # lower limit on heigth
+                    ]
+                )
             ]
+            for xyxy in [torch.tensor([(ref.xmin, ref.ymin, ref.xmax, ref.ymax)])]
         ]
         self.len: int = len(self.items) if limit < 0 else min(limit, len(self.items))
 
@@ -286,380 +234,365 @@ class CocoDataset(Dataset[tuple[PIL.Image, list[str], Float[torch.Tensor, "4"]]]
 
     def __getitem__(
         self, index: int
-    ) -> tuple[PIL.Image, list[str], Float[torch.Tensor, "4"]]:
-        i, ps, xywh = self.items[index]
-        xyxy: Float[torch.Tensor, "4"] = torchvision.ops.box_convert(
-            xywh, in_fmt="xywh", out_fmt="xyxy"
-        )
-        with PIL.Image.open(i) as img:
-            img.load()
-            return img, ps, xyxy
+    ) -> tuple[
+        TensorImage, list[str], Float[torch.Tensor, "X 5"], Float[torch.Tensor, "1 4"]
+    ]:
+        file_name, sents, xyxys, xyxy = self.items[index]
+        return read_image(file_name, ImageReadMode.RGB).to(device), sents, xyxys, xyxy
 
 
 # %%
-class Coco4CLIPDataset(Dataset[tuple[list[PIL.Image], list[str]]]):
+class CocoTrainDataset(
+    Dataset[
+        tuple[
+            list[TensorImage],
+            list[str],
+            int,
+            Float[torch.Tensor, "crops 4"],
+            Float[torch.Tensor, "1 4"],
+        ]
+    ]
+):
     def __init__(
         self,
         split: Split,
+        img2bboxes: dict[str, list[BBox]],
         limit: int = -1,
     ):
-        self.__init__
-        self.items: list[tuple[str, list[str], Float[torch.Tensor, "4"]]] = [
-            (i, [s.sent for s in ss], xywh)
+        self.items: list[
+            tuple[
+                str,
+                list[str],
+                int,
+                Float[torch.Tensor, "X 4"],
+                Float[torch.Tensor, "1 4"],
+            ]
+        ] = [
+            (img, sents, i, xyxys, xyxy)
             for ref in refs
             if ref.split == split
-            for i in [os.path.join(data_images, ref.file_name)]
-            for ss in [ref.sentences]
-            for xywh in [
-                torch.tensor(id2annotation[ref.ann_id].bbox, dtype=torch.float)
+            for img in [os.path.join(path_images, ref.file_name)]
+            for sents in [id2sents[ref.ref_id]]
+            for bboxes in [img2bboxes[ref.file_name]]
+            for xyxys in [
+                torch.tensor(
+                    [
+                        (bbox.xmin, bbox.ymin, bbox.xmax, bbox.ymax)
+                        for bbox in bboxes
+                        if bbox.confidence > 0.25  # lower bound on confidence
+                        if bbox.xmax - bbox.xmin > 16  # lower limit on width
+                        if bbox.ymax - bbox.ymin > 16  # lower limit on heigth
+                    ]
+                )
             ]
+            if xyxys.shape[1] > 1  # lower bound on # of bboxes per image
+            for xyxy in [torch.tensor([(ref.xmin, ref.ymin, ref.xmax, ref.ymax)])]
+            for ious in [box_iou(xyxys, xyxy)]
+            if torch.max(ious).item() > 0.5  # lower bound on maximum IoU
+            for i in [torch.argmax(ious).item()]
         ]
         self.len: int = len(self.items) if limit < 0 else min(limit, len(self.items))
 
     def __len__(self) -> int:
         return self.len
 
-    def __getitem__(self, index: int) -> tuple[list[PIL.Image], list[str]]:
-        i, ps, xywh = self.items[index]
-        xyxy: Float[torch.Tensor, "4"] = torchvision.ops.box_convert(
-            xywh, in_fmt="xywh", out_fmt="xyxy"
+    def __getitem__(
+        self, index: int
+    ) -> tuple[
+        list[TensorImage],
+        list[str],
+        int,
+        Float[torch.Tensor, "crops 4"],
+        Float[torch.Tensor, "1 4"],
+    ]:
+        file_name, sents, i, xyxys, xyxy = self.items[index]
+        img: TensorImage = read_image(file_name, ImageReadMode.RGB).to(device)
+
+        xywhs: Int[torch.Tensor, "X 4"] = (
+            box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").round().int()
         )
-        with PIL.Image.open(i) as img:
-            img.load()
-            return [img.crop(xyxy.tolist())], ps
+
+        crops: list[TensorImage] = [
+            crop(img, top=y, left=x, height=h, width=w)
+            for xywh in xywhs
+            for [x, y, w, h] in [xywh.tolist()]
+        ]
+
+        return crops, sents, i, xyxys, xyxy
 
 
 # %%
-def unzip(batch: list[tuple[T, ...]]) -> tuple[list[T], ...]:
-    return tuple(zip(*batch))
+import matplotlib.pyplot as plt
 
-
-# %%
-batch_size: int = 3
-limit: int = 5 * batch_size
-
-# %%
-dl: DataLoader[
-    tuple[list[PIL.Image], list[list[str]], list[Float[torch.Tensor, "4"]]]
-] = DataLoader(
-    dataset=CocoDataset(split="test", limit=limit),
-    batch_size=batch_size,
-    collate_fn=unzip,
-)
-
-# %%
-dl4clip: DataLoader[tuple[list[PIL.Image], list[str]]] = DataLoader(
-    dataset=Coco4CLIPDataset(split="test", limit=limit),
-    batch_size=batch_size,
-    collate_fn=unzip,
-    generator=torch.Generator(device=device),  # add for GPU
-    shuffle=True,
-)
-
-# %%
-imgs: tuple[PIL.Image, ...]
-promptss: tuple[list[str], ...]
-true_xyxy: tuple[Float[torch.Tensor, "4"], ...]
-
-for imgs, promptss, true_xyxy in dl:
-    print(imgs)
-    print(promptss)
-    print(true_xyxy)
-    print("-" * 50)
-
-# %%
-cropss: tuple[list[PIL.Image], ...]
-promptss: tuple[list[str], ...]
-
-for cropss, promptss in dl4clip:
-    print(cropss)
-    print(promptss)
-    print("-" * 50)
-
-
-# %% [markdown]
-# ## Yolov5
-
-# %%
-class Yolo_v5(torch.nn.Module):
-    def __init__(self, device=device):
-        super().__init__()
-
-        # load yolo model
-        self.yolo_model = torch.hub.load(
-            "ultralytics/yolov5", "yolov5s", pretrained=True
-        )
-        self.yolo_model.to(device=device).eval()
-
-    def forward(self, img):
-        # yolo bboxes
-        predictions = self.yolo_model(img)
-
-        # xmin,      ymin,      xmax,      ymax,      confidence, class
-        # 274.06390, 231.20389, 392.66345, 372.59018, 0.93251,    23.00000
-        bboxes: list[
-            Float[torch.Tensor, "X 6"]
-        ] = (
-            predictions.xyxy
-        )  # bboxes[i] contains the bboxes highlighted by yolo in image i
-
-        for image_idx, bbox_img in enumerate(bboxes):
-            # if empty, put a bbox equal to image size
-            if len(bbox_img) == 0:
-                bboxes[image_idx] = torch.tensor(
-                    [[0, 0, img[image_idx].size[0], img[image_idx].size[1], 0, 0]],
-                    dtype=torch.float,
-                )
-
-        return bboxes
-
-
-# %%
-# instantiate the region proposal algorithm
-yolo = Yolo_v5().to(device)
-
+for _, (crops, _, _, _, _) in zip(range(5), CocoTrainDataset("test", img2detr)):
+    for c in crops:
+        plt.imshow(c.permute(1, 2, 0).cpu())
+        plt.show(block=True)
 
 # %% [markdown]
 # # Attention is all you need
 # In the following of this notebook we try to fine tune CLIP using a self-attention based approach. In this context, we try to refine the latent representations of both visual and textual prompts by means of single head attention mechanism.
 
 # %%
-class attention_CLIP(nn.Module):
-    def __init__(self, device=device):
+clip_model, _ = clip.load("RN50", device=device)
+clip_model.eval()
+
+for p in clip_model.parameters():
+    p.requires_grad = False
+
+
+# %%
+def transform(n_px: int) -> Compose:
+    """
+    https://github.com/openai/CLIP/blob/a1d071733d7111c9c014f024669f959182114e33/clip/clip.py#L75-L86
+    """
+    return Compose(
+        [
+            ConvertImageDtype(torch.float),
+            Resize(n_px, interpolation=InterpolationMode.BICUBIC, antialias=True),
+            CenterCrop(n_px),
+            Normalize(
+                (0.48145466, 0.4578275, 0.40821073),
+                (0.26862954, 0.26130258, 0.27577711),
+            ),
+        ]
+    )
+
+
+preprocess: Compose = transform(224)
+
+
+# %%
+class ClipFreezedImgEnc(nn.Module):
+    def forward(
+        self, image: Float[torch.Tensor, "crops 3 244 244"]
+    ) -> Float[torch.Tensor, "crops 1024"]:
+        with torch.no_grad():
+            return clip_model.encode_image(image).float()
+
+
+class ClipFreezedTxtEnc(nn.Module):
+    def forward(
+        self, text: Int[torch.Tensor, "prompts 77"]
+    ) -> Float[torch.Tensor, "prompts 1024"]:
+        with torch.no_grad():
+            return clip_model.encode_text(text).float()
+
+
+# %%
+clip_freezed_img_encoder: ClipFreezedImgEnc = ClipFreezedImgEnc()
+clip_freezed_txt_encoder: ClipFreezedTxtEnc = ClipFreezedTxtEnc()
+
+
+# %%
+class ClipContexCore(nn.Module):
+    def __init__(
+        self,
+        img_encoder: nn.Module,  # visual encoder
+        txt_encoder: nn.Module,  # natural language prompts encoder
+    ):
         super().__init__()
-
-        # load clip model and preprocessing code
-        model, preprocess = clip.load("RN50")
-        model.float()  # add for GPU
-
-        # freeze all pretrained layers by setting requires_grad=False
-        for param in model.parameters():
-            param.requires_grad = False
-
-        self.clip_visual_encoder = model.encode_image
-        self.clip_text_encoder = model.encode_text
-        self.clip_visual_preprocess = preprocess
-        self.clip_text_preprocess = clip.tokenize
-
-        # attention operator
+        self.img_encoder = img_encoder
+        self.txt_encoder = txt_encoder
         self.attention = nn.MultiheadAttention(embed_dim=1024, num_heads=1)
 
-    # preprocess input prompts as required by the visual encoder
-    def visual_preprocess(self, _imgs):
-        prep_images = torch.stack([self.clip_visual_preprocess(i) for i in _imgs]).to(
-            device
-        )
-
-        return prep_images
-
-    # preprocess text prompts as required by the text encoder
-    def text_preprocess(self, _txts):
-        prep_texts = self.clip_text_preprocess(_txts)
-
-        return prep_texts
-
-    # visual encoder
-    def visual_encoder(self, image):
-        with torch.no_grad():
-            clipFeatures = self.clip_visual_encoder(image)
-        return clipFeatures
-
-    # text encoder
-    def text_encoder(self, text):
-        with torch.no_grad():
-            clipFeatures = self.clip_text_encoder(text)
-        return clipFeatures
-
-    def forward(self, image, text):
-        # image and text preprocessing
-        with torch.no_grad():
-            image_pre = self.visual_preprocess(image)
-            text_pre = self.text_preprocess(text)
-
-        # get image and text feature representation
-        image_features = self.visual_encoder(image_pre)
-        text_features = self.text_encoder(text_pre)
-
-        # store number of images and number of texts for later retrival
-        num_images = len(image)
-        num_texts = len(text)
-
+    def contextualize(
+        self,
+        crops_z: Float[torch.Tensor, "crops 1024"],
+        prompts_z: Float[torch.Tensor, "prompts 1024"],
+    ) -> tuple[Float[torch.Tensor, "crops 1024"], Float[torch.Tensor, "prompts 1024"]]:
         # concatenate image embeedings and prompt embeedings in the same latent context
-        context_features = torch.cat((image_features, text_features), dim=0)
-
-        # refine the latent representation of each text and image according to the overall context by means of the attention mechanism
-        attn_output, _ = self.attention(
-            context_features, context_features, context_features
+        concat: Float[torch.Tensor, "crops+prompts 1024"] = torch.cat(
+            (crops_z, prompts_z), dim=0
         )
+
+        contextualized: Float[torch.Tensor, "crops+prompts 1024"]
+        contextualized, _ = self.attention(concat, concat, concat)
 
         # retrive image_features and text_features by means of the previously stored indexes
-        image_features = attn_output[:num_images]
-        text_features = attn_output[-num_texts:]
+        return contextualized[: crops_z.shape[0]], contextualized[-prompts_z.shape[0] :]
 
-        return image_features, text_features
-
-
-# %%
-# instantiate the network and move it to the chosen device
-net = attention_CLIP().to(device)
-
-
-# %%
-def get_optimizer(model, _lr, _wd, _momentum):
-    optimizer = torch.optim.SGD(
-        params=model.parameters(), lr=_lr, weight_decay=_wd, momentum=_momentum
-    )
-    return optimizer
-
-
-# %%
-def get_accuracy_function():
-    def iou_accuracy(bbox_prediction, bbox_groundtruth):
-        # compute intersection over union between ground truth bboxes and predicted bboxes
-        iou_accuracy_matrix = torchvision.ops.box_iou(
-            bbox_prediction[:, :4], bbox_groundtruth
+    def cosine_similarity(
+        self,
+        crops_z: Float[torch.Tensor, "crops 1024"],
+        prompts_z: Float[torch.Tensor, "prompts 1024"],
+    ) -> Float[torch.Tensor, "prompts crops"]:
+        # normalise the image and the text
+        crops_z: Float[torch.Tensor, "crops 1024"] = crops_z / crops_z.norm(
+            dim=-1, keepdim=True
+        )
+        prompts_z: Float[torch.Tensor, "prompts 1024"] = prompts_z / prompts_z.norm(
+            dim=-1, keepdim=True
         )
 
-        # extract the diagonal elements
-        iou_accuracy_matrix_diagonal = torch.diag(iou_accuracy_matrix)
+        # evaluate the cosine similarity between the sets of features
+        return prompts_z @ crops_z.T
 
-        # compute the mean of the intersection over union
-        mean_iou = iou_accuracy_matrix_diagonal.mean()
+    def forward(
+        self,
+        crops: Float[torch.Tensor, "crops 3 244 244"],
+        prompts: Int[torch.Tensor, "prompts 77"],
+    ) -> Float[torch.Tensor, "crops 1"]:
+        # step 1: compute crop representation in the latent space
+        crops_z: Float[torch.Tensor, "crops 1024"] = self.img_encoder(crops)
 
-        # compute the iou accuracy
-        iou_accuracy_output = mean_iou.item()
+        # step 2: compute prompt representation in the latent space
+        prompts_z: Float[torch.Tensor, "prompts 1024"] = self.txt_encoder(prompts)
 
-        return iou_accuracy_output
+        # step 3: refine the latent representation of each text and image according to the overall context by means of the attention mechanism
+        crop_context_z: Float[torch.Tensor, "crops 1024"]
+        prompt_context_z: Float[torch.Tensor, "prompts 1024"]
+        crop_context_z, prompt_context_z = self.contextualize(crops_z, prompts_z)
 
-    return iou_accuracy
+        # step 4: evaluate logits
+        similarity_matrix: Float[
+            torch.Tensor, "prompts crops"
+        ] = self.cosine_similarity(crop_context_z, prompt_context_z)
+
+        # step 5: crops classification
+        return torch.mean(similarity_matrix, dim=0)
 
 
 # %%
-# input:
-#   -> retrived_bboxes : bounding boxes proposed by the region proposal model
-#   -> bbox_groundtruth : ground truth bounding box provided by the training sample
-# output:
-#   -> [3, 5] in this case for the first element in the batch the best bbox is the fourth, while for the second element in the batch the best bbox is the sixth. The best bbox is the one characterized by the largest IoU with the ground truth bbox
-def best_bbox_one_hot_encoding(retrived_bboxes, bbox_groundtruth):
-    batch_bbox_one_hot_encoding = []
-    for batch_item_retrived_bboxes, batch_item_bbox_groundtruth in zip(
-        retrived_bboxes, bbox_groundtruth
+class ClipContex(nn.Module):
+    def __init__(
+        self,
+        img_encoder: nn.Module,  # visual encoder
+        txt_encoder: nn.Module,  # natural language prompts encoder
     ):
-        iou_matrix = torchvision.ops.box_iou(
-            batch_item_retrived_bboxes[:, :4], batch_item_bbox_groundtruth.unsqueeze(0)
-        )
-        batch_bbox_one_hot_encoding.append(torch.argmax(iou_matrix, dim=0))
+        super().__init__()
+        self.core = ClipContexCore(img_encoder, txt_encoder)
 
-    batch_bbox_one_hot_encoding = torch.cat(batch_bbox_one_hot_encoding, dim=0)
+        self.img_preprocess: Compose = preprocess
+        self.txt_preprocess: t.Callable[
+            [t.Union[str, list[str]]], Float[torch.Tensor, "77"]
+        ] = clip.tokenize
 
-    return batch_bbox_one_hot_encoding
+    def forward(
+        self, crops: list[TensorImage], prompts: list[str]
+    ) -> Float[torch.Tensor, "crops 1"]:
+        # step 1: preprocess crops as required by the visual encoder
+        with torch.no_grad():
+            crops_preprocessed: Float[torch.Tensor, "crops 3 244 244"] = torch.stack(
+                [self.img_preprocess(crop) for crop in crops]
+            )
+
+        # step 2: preprocess prompts as required by the text encoder
+        with torch.no_grad():
+            prompts_preprocessed: Int[torch.Tensor, "prompts 77"] = self.txt_preprocess(
+                prompts
+            )
+
+        return self.core(crops_preprocessed, prompts_preprocessed)
 
 
 # %%
-def cosine_similarity(images_z: torch.Tensor, texts_z: torch.Tensor):
-    # normalise the image and the text
-    images_z = images_z / images_z.norm(dim=-1, keepdim=True)
-    texts_z = texts_z / texts_z.norm(dim=-1, keepdim=True)
+with SummaryWriter() as writer:
+    writer.add_graph(
+        model=ClipContexCore(
+            img_encoder=clip_freezed_img_encoder,
+            txt_encoder=clip_freezed_txt_encoder,
+        ),
+        input_to_model=[
+            torch.ones((5, 3, 244, 244)),
+            torch.ones((2, 77), dtype=torch.int),
+        ],
+    )
 
-    # evaluate the cosine similarity between the sets of features
-    similarity = texts_z @ images_z.T
+# %%
+summary(
+    ClipContexCore(
+        img_encoder=clip_freezed_img_encoder,
+        txt_encoder=clip_freezed_txt_encoder,
+    ),
+    input_size=[(5, 3, 244, 244), (2, 77)],
+    dtypes=[torch.float, torch.int],
+    col_names=["input_size", "output_size", "num_params", "trainable"],
+)
 
-    return similarity
+
+# %%
+def unzip(batch: list[tuple[T, ...]]) -> tuple[tuple[T, ...], ...]:
+    """
+
+    >>> unzip([('A', 1), ('B', 2)])
+    (('A', 'B'), (1, 2))
+
+    """
+    return tuple(zip(*batch))
+
+
+# %%
+def best_bbox(
+    pred: Float[torch.Tensor, "crops 4"], groundtruth: Float[torch.Tensor, "1 4"]
+) -> int:
+    """
+
+    >>> best_bbox(
+    ...     torch.tensor([[0, 0, 1, 1], [0, 0, 2, 2], [1, 1, 2, 2]]),
+    ...     torch.tensor([[0, 0, 1, 1]])
+    ... )
+    0
+
+    >>> best_bbox(
+    ...     torch.tensor([[0, 0, 0, 0], [0, 0, 2, 2], [1, 1, 2, 2]]),
+    ...     torch.tensor([[0, 0, 1, 1]])
+    ... )
+    1
+
+    """
+    return torch.argmax(box_iou(pred, groundtruth)).item()
+
+
+# %%
+loss_fn: t.Callable[
+    [Float[torch.Tensor, "crops"], Int[torch.Tensor, "1"]], Float[torch.Tensor, "1"]
+] = nn.functional.cross_entropy
 
 
 # %%
 def training_step(
-    model: torch.nn.Module,
-    region_proposal_model: torch.nn.Module,
-    data_loader: torch.utils.data.DataLoader,
-    loss_fn: torch.nn.Module,
-    accuracy_fn,
+    model: nn.Module,
+    data_loader: DataLoader[
+        tuple[
+            tuple[TensorImage, ...],
+            tuple[str, ...],
+            int,
+            Float[torch.Tensor, "crops 4"],
+            Float[torch.Tensor, "1 4"],
+        ]
+    ],
     optimizer: torch.optim.Optimizer,
-    device: torch.device = device,
-):
-    train_loss, iou_train_acc = 0, 0
-    model.to(device)
+) -> tuple[float, float]:
     model.train()
-    region_proposal_model.to(device)
 
-    for batch_idx, (imgs, promptss, true_xyxy) in tqdm(enumerate(data_loader)):
-        # send data to target device
-        # todo: send data to target device
+    running_loss: float = 0
+    running_acc: float = 0
+    progress = tqdm(data_loader, desc="training")
 
-        """
-        print("imgs")
-        print(imgs)
+    cropss: tuple[tuple[TensorImage, ...], ...]
+    promptss: tuple[tuple[str, ...], ...]
+    true_is: tuple[int, ...]
+    xyxyss: tuple[Float[torch.Tensor, "crops 4"], ...]
+    true_xyxys: tuple[Float[torch.Tensor, "1 4"], ...]
 
-        print("promptss")
-        print(promptss)
-
-        print("true_xyxy")
-        print(true_xyxy)
-        """
-
-        with torch.no_grad():
-            # i. region proposal
-            bboxes = region_proposal_model(imgs)
-
-            # ii. get best bounding box with respect to the ground truth
-            bbox_groundtruth = best_bbox_one_hot_encoding(bboxes, true_xyxy)
-
-            # from yolo bboxes to cropped images
-            crops = []
-            for batch_image, batch_image_bboxes in zip(imgs, bboxes):
-                list_bboxes_image: list[Image] = [
-                    batch_image.crop((xmin, ymin, xmax, ymax))
-                    for bbox in batch_image_bboxes
-                    for [xmin, ymin, xmax, ymax, _, _] in [bbox.tolist()]
-                ]
-
-                crops.append(list_bboxes_image)
-
-        ####print("bboxes")
-        ####print(bboxes)
-
+    for iter, (cropss, promptss, true_is, xyxyss, true_xyxys) in zip(
+        it.count(1), progress
+    ):
         # forward pass
-        cropss_z = []
-        promptss_z = []
-        for c, p in zip(crops, promptss):
-            model_output = model(c, p)
-            model_output_image_features = model_output[0]
-            model_output_text_features = model_output[1]
+        preds: list[Float[torch.Tensor, "crops"]] = [
+            model(crops, prompts) for crops, prompts in zip(cropss, promptss)
+        ]
 
-            cropss_z.append(model_output_image_features)
-            promptss_z.append(model_output_text_features)
-
-        ####print("cropss_z")
-        ####print(cropss_z)
-
-        ####print("promptss_z")
-        ####print(promptss_z)
-
-        # cosine similarity evaluation
-        #   cropss_z :: list of BATCH_SIZE tensors: [tensor([bbox_img_1, 1024]), tensor([bbox_img_2, 1024]), ..., tensor([bbox_img_BATCH_SIZE, 1024])]
-        #   promptss_z :: list of BATCH_SIZE tensors: [tensor([prompts_img_1, 1024]), tensor([prompts_img_2, 1024]), ..., tensor([prompts_img_BATCH_SIZE, 1024])]
-        bbox_index_pred = (
-            []
-        )  # for each batch sample this list contains the index of the predicted bbox at the end of the iteration
-        loss = 0.0
-        for c_z, p_z, y in zip(cropss_z, promptss_z, bbox_groundtruth):
-            # rows :: prompts ; columns: crops
-            cosine_similarity_matrix = cosine_similarity(c_z, p_z)
-
-            # for each crop we set the average cosine similarity with the prompts
-            crop_logits = torch.mean(cosine_similarity_matrix, dim=0)
-
-            # calculate loss
-            loss = loss + loss_fn(
-                crop_logits, y
-            )  # TODO: in contrastive manca questo +, c'è solo: loss = loss_fn(crop_logits, y)
-
-            # get index of the predicted bounding box in order to compute IoU accuracy
-            bbox_index_pred.append(crop_logits.argmax().item())
-
-        loss = loss / len(bbox_groundtruth)  # avg loss
-
-        train_loss += loss
+        # calculate loss
+        losses: Float[torch.Tensor, "batch"] = torch.stack(
+            [
+                loss_fn(pred, torch.tensor(true_i))
+                for pred, true_i in zip(preds, true_is)
+            ]
+        )
+        loss: Float[torch.Tensor, "1"] = torch.mean(losses)
+        running_loss += loss.item()
 
         # optimizer zero grad
         optimizer.zero_grad()
@@ -667,339 +600,518 @@ def training_step(
         # loss backward
         loss.backward()
 
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                gradient_norm = torch.norm(param.grad)
+                print(f"Parameter: {name}, Gradient Norm: {gradient_norm}")
+
         # optimizer step
         optimizer.step()
 
-        with torch.no_grad():
-            # get predicted bounding box for each example in the batch
-            bbox_pred = [
-                batch_example_bboxes[idx]
-                for batch_example_bboxes, idx in zip(bboxes, bbox_index_pred)
+        # calculate IoU accuracy
+        with torch.inference_mode():
+            # # get indexes of the predicted bounding box to compute IoU accuracy
+            pred_is: list[int] = [torch.argmax(pred).item() for pred in preds]
+
+            # # get predicted bounding boxes
+            pred_xyxys: list[Float[torch.Tensor, "4"]] = [
+                xyxys[pred_i] for xyxys, pred_i in zip(xyxyss, pred_is)
             ]
 
-            ###prediction_obj = Prediction(imgs[0], promptss[0], true_xyxy[0], bbox_pred[0][:4])
-            ###display_predictions([prediction_obj])
+            # # IoU
+            acc: float = torch.mean(
+                box_iou(torch.cat(true_xyxys), torch.stack(pred_xyxys)).diagonal()
+            ).item()
+            running_acc += acc
 
-            # calculate intersection over union train accuracy
-            acc = accuracy_fn(
-                torch.stack(bbox_pred, dim=0), torch.stack(list(true_xyxy), dim=0)
+            progress.set_postfix(
+                {
+                    "loss": running_loss / iter,
+                    "iou": running_acc / iter,
+                },
+                refresh=False,
             )
-            iou_train_acc += acc
 
-    # Adjust metrics and print out
-    train_loss /= len(data_loader)
-    iou_train_acc /= len(data_loader)
-    print(f"Train loss: {train_loss:.5f} | IoU train accuracy: {iou_train_acc:.5f}\n")
-    return train_loss, iou_train_acc
+    return running_loss / len(data_loader), running_acc / len(data_loader)
 
-
-# %% [markdown]
-# #### test loop
 
 # %%
 def test_step(
-    model: torch.nn.Module,
-    region_proposal_model: torch.nn.Module,
-    data_loader: torch.utils.data.DataLoader,
-    loss_fn: torch.nn.Module,
-    accuracy_fn,
-    device: torch.device = device,
-):
-    test_loss, iou_test_acc = 0, 0
-    model.to(device)
+    model: nn.Module,
+    data_loader: DataLoader[
+        tuple[
+            TensorImage, list[str], Float[torch.Tensor, "X 4"], Float[torch.Tensor, "4"]
+        ]
+    ],
+) -> tuple[float, float]:
     model.eval()
-    region_proposal_model.to(device)
+
+    running_loss: float = 0
+    running_acc: float = 0
+    progress = tqdm(data_loader, desc="testing")
 
     with torch.inference_mode():
-        for batch_idx, (imgs, promptss, true_xyxy) in tqdm(enumerate(data_loader)):
-            # send data to target device
-            # todo: send data to target device
+        img: TensorImage
+        prompts: list[str]
+        xyxys: Float[torch.Tensor, "crops 4"]
+        xyxy: Float[torch.Tensor, "4"]
 
-            # i. region proposal
-            bboxes = region_proposal_model(imgs)
+        for iter, (img, prompts, xyxys, true_xyxy) in zip(it.count(1), progress):
+            true_i: int = best_bbox(xyxys, true_xyxy)
 
-            # ii. get best bounding box with respect to the ground truth
-            bbox_groundtruth = best_bbox_one_hot_encoding(bboxes, true_xyxy)
+            # from xyxys to crops
+            xywhs: Int[torch.Tensor, "X 4"] = (
+                box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").round().int()
+            )
 
-            # from yolo bboxes to cropped images
-            crops = []
-            for batch_image, batch_image_bboxes in zip(imgs, bboxes):
-                list_bboxes_image: list[Image] = [
-                    batch_image.crop((xmin, ymin, xmax, ymax))
-                    for bbox in batch_image_bboxes
-                    for [xmin, ymin, xmax, ymax, _, _] in [bbox.tolist()]
-                ]
-
-                crops.append(list_bboxes_image)
-
-            # forward pass
-            cropss_z = []
-            promptss_z = []
-            for c, p in zip(crops, promptss):
-                model_output = model(c, p)
-                model_output_image_features = model_output[0]
-                model_output_text_features = model_output[1]
-
-                cropss_z.append(model_output_image_features)
-                promptss_z.append(model_output_text_features)
-
-            # cosine similarity evaluation
-            #   cropss_z :: list of BATCH_SIZE tensors: [tensor([bbox_img_1, 1024]), tensor([bbox_img_2, 1024]), ..., tensor([bbox_img_BATCH_SIZE, 1024])]
-            #   promptss_z :: list of BATCH_SIZE tensors: [tensor([prompts_img_1, 1024]), tensor([prompts_img_2, 1024]), ..., tensor([prompts_img_BATCH_SIZE, 1024])]
-            bbox_index_pred = (
-                []
-            )  # for each batch sample this list contains the index of the predicted bbox at the end of the iteration
-            loss = 0.0
-            for c_z, p_z, y in zip(cropss_z, promptss_z, bbox_groundtruth):
-                crop_logits = (
-                    []
-                )  # for each crop we set the average cosine similarity with the prompts
-                for vector_c_z in c_z:
-                    vector_c_z_cos_similarities = []
-                    for vector_p_z in p_z:
-                        cosine_similarity = torch.nn.CosineSimilarity()(
-                            vector_c_z.unsqueeze(0), vector_p_z.unsqueeze(0)
-                        ).item()
-                        vector_c_z_cos_similarities.append(cosine_similarity)
-
-                    mean_cosine_similarity = sum(vector_c_z_cos_similarities) / len(
-                        vector_c_z_cos_similarities
-                    )
-
-                    crop_logits.append(mean_cosine_similarity)
-
-                # calculate loss
-                loss = loss + loss_fn(
-                    torch.tensor(crop_logits).to(device), y.to(device)
-                )
-
-                # get index of the predicted bounding box in order to compute IoU accuracy
-                bbox_index_pred.append(crop_logits.index(max(crop_logits)))
-
-            loss = loss / len(bbox_groundtruth)  # avg loss
-            test_loss += loss
-
-            # get predicted bounding box for each example in the batch
-            bbox_pred = [
-                batch_example_bboxes[idx]
-                for batch_example_bboxes, idx in zip(bboxes, bbox_index_pred)
+            crops: list[TensorImage] = [
+                crop(img, top=y, left=x, height=h, width=w)
+                for xywh in xywhs
+                for [x, y, w, h] in [xywh.tolist()]
             ]
 
-            ###prediction_obj = Prediction(imgs[0], promptss[0], true_xyxy[0], bbox_pred[0][:4])
-            ###display_predictions([prediction_obj])
+            # forward pass
+            model_output: Float[torch.Tensor, "crops"] = model(crops, prompts)
 
-            # calculate intersection over union train accuracy
-            acc = accuracy_fn(
-                torch.stack(bbox_pred, dim=0), torch.stack(list(true_xyxy), dim=0)
+            # calculate loss
+            loss: float = loss_fn(model_output, torch.tensor(true_i)).item()
+            running_loss += loss
+
+            # calculate IoU accuracy
+
+            # # get index of the predicted bounding box to compute IoU accuracy
+            pred_i: int = torch.argmax(model_output).item()
+
+            # # get predicted bounding
+            pred_xyxy: Float[torch.Tensor, "4"] = xyxys[pred_i]
+
+            # # IoU
+            acc: float = box_iou(true_xyxy, pred_xyxy.unsqueeze(0)).item()
+            running_acc += acc
+
+            progress.set_postfix(
+                {
+                    "loss": running_loss / iter,
+                    "iou": running_acc / iter,
+                },
+                refresh=False,
             )
-            iou_test_acc += acc
 
-        # Adjust metrics and print out
-        test_loss /= len(data_loader)
-        iou_test_acc /= len(data_loader)
-        print(f"Test loss: {test_loss:.5f} | IoU test accuracy: {iou_test_acc:.5f}\n")
-        return test_loss, iou_test_acc
+        return running_loss / len(data_loader), running_acc / len(data_loader)
+
+
+# %%
+def showtime(
+    model: nn.Module,
+    data_loader: DataLoader[
+        tuple[
+            TensorImage, list[str], Float[torch.Tensor, "X 4"], Float[torch.Tensor, "4"]
+        ]
+    ],
+    writer: SummaryWriter,
+    global_step: int,
+) -> None:
+    model.eval()
+
+    with torch.inference_mode():
+        img: TensorImage
+        prompts: list[str]
+        xyxys: Float[torch.Tensor, "crops 4"]
+        xyxy: Float[torch.Tensor, "4"]
+
+        progress = tqdm(data_loader, desc=f"showtime")
+
+        for iter, (img, prompts, xyxys, true_xyxy) in zip(it.count(1), progress):
+            true_i: int = best_bbox(xyxys, true_xyxy)
+
+            # from xyxys to crops
+            xywhs: Int[torch.Tensor, "X 4"] = (
+                box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").round().int()
+            )
+
+            crops: list[TensorImage] = [
+                crop(img, top=y, left=x, height=h, width=w)
+                for xywh in xywhs
+                for [x, y, w, h] in [xywh.tolist()]
+            ]
+
+            # forward pass
+            model_output: Float[torch.Tensor, "crops"] = model(crops, prompts)
+
+            # get index of the predicted bounding box to compute IoU accuracy
+            pred_i: int = torch.argmax(model_output).item()
+
+            # get predicted bounding
+            pred_xyxy: Float[torch.Tensor, "4"] = xyxys[pred_i]
+
+            # https://github.com/pytorch/pytorch/issues/65449
+            writer.add_image_with_boxes(
+                tag=f"{iter}: {' ¶ '.join(prompts)}",
+                img_tensor=img,
+                box_tensor=torch.stack(
+                    (xyxys[pred_i], xyxys[true_i], true_xyxy.squeeze())
+                ),
+                labels=["prediction", "best region proposal", "ground truth"],
+                global_step=global_step,
+            )
+
+
+# %%
+def eval_step(
+    model: nn.Module,
+    data_loader: DataLoader[
+        tuple[
+            TensorImage, list[str], Float[torch.Tensor, "X 4"], Float[torch.Tensor, "4"]
+        ]
+    ],
+    img_preprocess: t.Callable[[TensorImage], Float[torch.Tensor, "3 244 244"]],
+) -> pd.DataFrame:
+    model.eval()
+
+    ious: list[float] = []
+    coss: list[float] = []
+    euds: list[float] = []
+
+    with torch.inference_mode():
+        img: TensorImage
+        prompts: list[str]
+        xyxys: Float[torch.Tensor, "crops 4"]
+        xyxy: Float[torch.Tensor, "4"]
+
+        progress = tqdm(data_loader, desc=f"eval")
+
+        for iter, (img, prompts, xyxys, true_xyxy) in enumerate(progress):
+            true_i: int = best_bbox(xyxys, true_xyxy)
+
+            # from xyxys to crops
+            xywhs: Int[torch.Tensor, "X 4"] = (
+                box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").round().int()
+            )
+
+            crops: list[TensorImage] = [
+                crop(img, top=y, left=x, height=h, width=w)
+                for xywh in xywhs
+                for [x, y, w, h] in [xywh.tolist()]
+            ]
+
+            # from true_xyxy to true_crop
+            true_xywh: Int[torch.Tensor, "1 4"] = (
+                box_convert(true_xyxy, in_fmt="xyxy", out_fmt="xywh").round().int()
+            )
+
+            true_crop: TensorImage
+            [true_crop] = [
+                crop(img, top=y, left=x, height=h, width=w)
+                for xywh in true_xywh
+                for [x, y, w, h] in [xywh.tolist()]
+            ]
+
+            # forward pass
+            model_output: Float[torch.Tensor, "crops"] = model(crops, prompts)
+
+            # get index of the predicted bounding box to compute IoU accuracy
+            pred_i: int = torch.argmax(model_output).item()
+
+            # get predicted bounding
+            pred_xyxy: Float[torch.Tensor, "1 4"] = xyxys[pred_i].unsqueeze(0)
+
+            iou: float = box_iou(true_xyxy, pred_xyxy).item()
+            ious.append(iou)
+
+            true_z: Float[torch.Tensor, "1 1024"] = clip_freezed_img_encoder(
+                img_preprocess(true_crop).unsqueeze(0)
+            )
+            pred_z: Float[torch.Tensor, "1 1024"] = clip_freezed_img_encoder(
+                img_preprocess(crops[pred_i]).unsqueeze(0)
+            )
+
+            cos: float = torch.nn.functional.cosine_similarity(true_z, pred_z).item()
+            coss.append(cos)
+
+            eud: float = torch.cdist(true_z, pred_z, p=2).item()
+            euds.append(eud)
+
+        return pd.DataFrame(
+            {
+                "iou": ious,
+                "cos similarity": coss,
+                "euclidean distance": euds,
+            }
+        )
 
 
 # %% [markdown]
 # #### main training-evaluation loop
 
 # %%
-# tensorboard logging utilities
-def log_values_evaluation(writer, step, loss, accuracy, prefix):
-    writer.add_scalar(f"{prefix}/loss", loss, step)
-    writer.add_scalar(f"{prefix}/accuracy", accuracy, step)
-
+BATCH_SIZE: int = 4
+LIMIT: int = 1 * BATCH_SIZE
+NUM_WORKERS: int = 0  # os.cpu_count() or 1
+EPOCHS: int = 50
 
 # %%
-# setting a manual seed allow us to provide reprudicible results in this notebook
-torch.manual_seed(42)
-
-# create a logger for the experiment
-writer = SummaryWriter(log_dir="runs/exp1")
-
-BATCH_SIZE = 3
-LIMIT = 5 * BATCH_SIZE
-
-# get dataset instance
-train_dataset = CocoDataset(split="train", limit=LIMIT)
-test_dataset = CocoDataset(split="test", limit=LIMIT)
-val_dataset = CocoDataset(split="val", limit=LIMIT)
-print(
-    f"LEN_TRAIN_DATASET: {len(train_dataset)}, LEN_TEST_DATASET: {len(test_dataset)}, LEN_VALIDATION_DATASET: {len(val_dataset)}"
-)
-
-# get dataloaders
-print(
-    f"Creating DataLoader's with batch size {BATCH_SIZE}."
-)  # todo: togliere NUM_WORKERS anche da contrastive learning code
 train_loader: DataLoader[
-    tuple[list[PIL.Image], list[list[str]], list[Float[torch.Tensor, "4"]]]
+    tuple[
+        tuple[TensorImage, ...],
+        tuple[str, ...],
+        int,
+        Float[torch.Tensor, "crops 4"],
+        Float[torch.Tensor, "1 4"],
+    ]
 ] = DataLoader(
-    dataset=train_dataset,
+    dataset=CocoTrainDataset(split="train", img2bboxes=img2detr, limit=LIMIT),
+    generator=g,
     batch_size=BATCH_SIZE,
-    generator=torch.Generator(device=device),  # add for GPU
+    num_workers=NUM_WORKERS,
     collate_fn=unzip,
     shuffle=True,
 )
-test_loader: DataLoader[
-    tuple[list[PIL.Image], list[list[str]], list[Float[torch.Tensor, "4"]]]
+
+
+split2loader: dict[
+    Split,
+    DataLoader[
+        tuple[
+            TensorImage, list[str], Float[torch.Tensor, "X 4"], Float[torch.Tensor, "4"]
+        ]
+    ],
+] = {
+    split: DataLoader(
+        dataset=CocoDataset(split=split, img2bboxes=img2detr, limit=LIMIT),
+        batch_size=None,
+        num_workers=NUM_WORKERS,
+        shuffle=False,
+    )
+    for split in ["train", "val", "test"]
+}
+
+
+showtime_loader: DataLoader[
+    tuple[TensorImage, list[str], Float[torch.Tensor, "X 4"], Float[torch.Tensor, "4"]]
 ] = DataLoader(
-    dataset=test_dataset,
-    batch_size=BATCH_SIZE,
-    collate_fn=unzip,
-)
-val_loader: DataLoader[
-    tuple[list[PIL.Image], list[list[str]], list[Float[torch.Tensor, "4"]]]
-] = DataLoader(
-    dataset=val_dataset,
-    batch_size=BATCH_SIZE,
-    collate_fn=unzip,
-)
-print(
-    f"LEN_TRAIN_DATALOADER: {len(train_loader)}, LEN_TEST_DATALOADER: {len(val_loader)}, LEN_VALIDATION_DATALOADER: {len(test_loader)}"
+    dataset=CocoDataset(split="test", img2bboxes=img2detr, limit=20),
+    batch_size=None,
+    num_workers=NUM_WORKERS,
+    shuffle=False,
 )
 
-# instantiate the optimizer
-learning_rate = 0.01
-weight_decay = 0.000001
-momentum = 0.9
-optimizer = get_optimizer(net, learning_rate, weight_decay, momentum)
 
-# define the cost function
-loss_function = torch.nn.CrossEntropyLoss()
+# %%
+def training_loop(
+    name: str,
+    model: nn.Module,
+    optimizer: t.Callable[[t.Iterable[torch.Tensor]], torch.optim.Optimizer],
+) -> pd.DataFrame:
+    loss: dict[str, list[float]] = defaultdict(list)
+    accs: dict[str, list[float]] = defaultdict(list)
 
-# define the accuracy function
-accuracy_function = get_accuracy_function()
-
-print("Before training:")
-train_loss, train_accuracy = test_step(
-    model=net,
-    region_proposal_model=yolo,
-    data_loader=train_loader,
-    loss_fn=loss_function,
-    accuracy_fn=accuracy_function,
-)
-
-test_loss, test_accuracy = test_step(
-    model=net,
-    region_proposal_model=yolo,
-    data_loader=test_loader,
-    loss_fn=loss_function,
-    accuracy_fn=accuracy_function,
-)
-
-val_loss, val_accuracy = test_step(
-    model=net,
-    region_proposal_model=yolo,
-    data_loader=val_loader,
-    loss_fn=loss_function,
-    accuracy_fn=accuracy_function,
-)
-
-# log to TensorBoard
-log_values_evaluation(writer, -1, train_loss, train_accuracy, "train")
-log_values_evaluation(writer, -1, val_loss, val_accuracy, "validation")
-log_values_evaluation(writer, -1, test_loss, test_accuracy, "test")
-
-print(
-    "\tTraining loss {:.5f}, Training accuracy {:.5f}".format(
-        train_loss, train_accuracy
-    )
-)
-print(
-    "\tValidation loss {:.5f}, Validation accuracy {:.5f}".format(
-        val_loss, val_accuracy
-    )
-)
-print("\tTest loss {:.5f}, Test accuracy {:.5f}".format(test_loss, test_accuracy))
-print("-----------------------------------------------------")
-
-# measure time
-train_time_start = timer()
-
-EPOCHS = 3
-for epoch in tqdm(range(EPOCHS)):
-    train_loss, train_accuracy = training_step(
-        model=net,
-        region_proposal_model=yolo,
-        data_loader=train_loader,
-        loss_fn=loss_function,
-        accuracy_fn=accuracy_function,
-        optimizer=optimizer,
-    )
-
-    val_loss, val_accuracy = test_step(
-        model=net,
-        region_proposal_model=yolo,
-        data_loader=val_loader,
-        loss_fn=loss_function,
-        accuracy_fn=accuracy_function,
-    )
-
-    # logs to TensorBoard
-    log_values_evaluation(writer, epoch, train_loss, train_accuracy, "train")
-    log_values_evaluation(writer, epoch, val_loss, val_accuracy, "validation")
-
-    print(
-        "\tTraining loss {:.5f}, Training accuracy {:.5f}".format(
-            train_loss, train_accuracy
+    # create a logger for the experiment
+    with SummaryWriter(f"runs/{name}") as writer:
+        # computes evaluation results before training
+        print("Before training:")
+        bna_train_loss, bna_train_accuracy = test_step(
+            model=model,
+            data_loader=split2loader["train"],
         )
-    )
-    print(
-        "\tValidation loss {:.5f}, Validation accuracy {:.5f}".format(
-            val_loss, val_accuracy
+        test_loss, test_accuracy = test_step(
+            model=model,
+            data_loader=split2loader["test"],
         )
+        val_loss, val_accuracy = test_step(
+            model=model,
+            data_loader=split2loader["val"],
+        )
+
+        showtime(model=model, data_loader=showtime_loader, writer=writer, global_step=0)
+
+        loss["BA train"].append(bna_train_loss)
+        accs["BA train"].append(bna_train_accuracy)
+        loss["test"].append(test_loss)
+        accs["test"].append(test_accuracy)
+        loss["val"].append(val_loss)
+        accs["val"].append(val_accuracy)
+
+        # log to TensorBoard
+        writer.add_scalars(
+            main_tag="loss",
+            tag_scalar_dict={
+                "BA train": bna_train_loss,
+                "test": test_loss,
+                "val": val_loss,
+            },
+            global_step=0,
+        )
+        writer.add_scalars(
+            main_tag="accuracy",
+            tag_scalar_dict={
+                "BA train": bna_train_accuracy,
+                "test": test_accuracy,
+                "val": val_accuracy,
+            },
+            global_step=0,
+        )
+
+        progress = trange(EPOCHS, desc="EPOCHS")
+        for epoch in progress:
+            train_loss, train_accuracy = training_step(
+                model=model,
+                data_loader=train_loader,
+                optimizer=optimizer(model.parameters()),
+            )
+
+            val_loss, val_accuracy = test_step(
+                model=model,
+                data_loader=split2loader["val"],
+            )
+
+            loss["train"].append(train_loss)
+            accs["train"].append(train_accuracy)
+            loss["val"].append(val_loss)
+            accs["val"].append(val_accuracy)
+
+            # log to TensorBoard
+            writer.add_scalars(
+                main_tag="loss",
+                tag_scalar_dict={
+                    "train": train_loss,
+                    "val": val_loss,
+                },
+                global_step=epoch + 1,
+            )
+            writer.add_scalars(
+                main_tag="accuracy",
+                tag_scalar_dict={
+                    "train": train_accuracy,
+                    "val": val_accuracy,
+                },
+                global_step=epoch + 1,
+            )
+
+            progress.set_postfix(
+                {
+                    "train/loss": train_loss,
+                    "val/loss": val_loss,
+                    "train/accuracy": train_accuracy,
+                    "val/accuracy": val_accuracy,
+                },
+                refresh=False,
+            )
+
+            # store model
+            torch.save(obj=model.state_dict(), f=f"{name}-{epoch + 1}.pth")
+
+        # compute final evaluation results
+        print("After training:")
+
+        bna_train_loss, bna_train_accuracy = test_step(
+            model=model,
+            data_loader=split2loader["train"],
+        )
+        test_loss, test_accuracy = test_step(
+            model=model,
+            data_loader=split2loader["test"],
+        )
+
+        showtime(
+            model=model,
+            data_loader=showtime_loader,
+            writer=writer,
+            global_step=EPOCHS,
+        )
+
+        loss["BA train"].append(bna_train_loss)
+        accs["BA train"].append(bna_train_accuracy)
+        loss["test"].append(test_loss)
+        accs["test"].append(test_accuracy)
+
+        # log to TensorBoard
+        writer.add_scalars(
+            main_tag="loss",
+            tag_scalar_dict={
+                "BA train": bna_train_loss,
+                "test": test_loss,
+            },
+            global_step=EPOCHS,
+        )
+        writer.add_scalars(
+            main_tag="accuracy",
+            tag_scalar_dict={
+                "BA train": bna_train_accuracy,
+                "test": test_accuracy,
+            },
+            global_step=EPOCHS,
+        )
+
+        return pd.concat(
+            [
+                pd.concat(
+                    [pd.Series(v).describe() for v in loss.values()],
+                    axis=1,
+                    keys=[k for k in loss.keys()],
+                ),
+                pd.concat(
+                    [pd.Series(v).describe() for v in accs.values()],
+                    axis=1,
+                    keys=[k for k in accs.keys()],
+                ),
+            ],
+            axis=1,
+            keys=["loss", "accuracy"],
+        )
+
+
+# %%
+# instantiate the network and move it to the chosen device
+name: str = "context"
+model: ClipContex = ClipContex(
+    img_encoder=clip_freezed_img_encoder,
+    txt_encoder=clip_freezed_txt_encoder,
+).to(device)
+
+# %%
+report: pd.DataFrame = training_loop(
+    name,
+    model,
+    lambda params: torch.optim.SGD(
+        params=params, lr=0.01, weight_decay=1e-6, momentum=0.9
+    ),
+)
+report.to_csv(f"training-{name}.csv")
+
+
+# %%
+def compare(reports: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "mA[IoU .3]": [
+                (report["iou"] >= 0.3).sum() / report["iou"].count()
+                for report in reports.values()
+            ],
+            "mA[IoU .5]": [
+                (report["iou"] >= 0.5).sum() / report["iou"].count()
+                for report in reports.values()
+            ],
+            "mA[IoU .7]": [
+                (report["iou"] >= 0.7).sum() / report["iou"].count()
+                for report in reports.values()
+            ],
+            "mIoU": [report["iou"].mean() for report in reports.values()],
+            "mCos": [report["cos similarity"].mean() for report in reports.values()],
+            "mED": [report["euclidean distance"].mean() for report in reports.values()],
+        },
+        index=reports.keys(),
     )
-    print("-----------------------------------------------------")
 
-train_time_end = timer()
-total_train_time_model_1 = print_train_time(
-    start=train_time_start, end=train_time_end, device=device
-)
-# compute final evaluation results
-print("After training:")
-train_loss, train_accuracy = test_step(
-    model=net,
-    region_proposal_model=yolo,
-    data_loader=train_loader,
-    loss_fn=loss_function,
-    accuracy_fn=accuracy_function,
-)
 
-test_loss, test_accuracy = test_step(
-    model=net,
-    region_proposal_model=yolo,
-    data_loader=test_loader,
-    loss_fn=loss_function,
-    accuracy_fn=accuracy_function,
-)
+# %%
+eval_reports: dict[Split, pd.DataFrame] = {
+    split: eval_step(model, loader, preprocess)
+    for split, loader in split2loader.items()
+}
 
-val_loss, val_accuracy = test_step(
-    model=net,
-    region_proposal_model=yolo,
-    data_loader=val_loader,
-    loss_fn=loss_function,
-    accuracy_fn=accuracy_function,
-)
+# %%
+for split, report in eval_reports.items():
+    report.describe().to_csv(f"eval-{name}-{split}.csv")
 
-# log to TensorBoard
-log_values_evaluation(writer, EPOCHS, train_loss, train_accuracy, "train")
-log_values_evaluation(writer, EPOCHS, val_loss, val_accuracy, "validation")
-log_values_evaluation(writer, EPOCHS, test_loss, test_accuracy, "test")
-
-print(
-    "\tTraining loss {:.5f}, Training accuracy {:.5f}".format(
-        train_loss, train_accuracy
-    )
-)
-print(
-    "\tValidation loss {:.5f}, Validation accuracy {:.5f}".format(
-        val_loss, val_accuracy
-    )
-)
-print("\tTest loss {:.5f}, Test accuracy {:.5f}".format(test_loss, test_accuracy))
-print("-----------------------------------------------------")
-
-# closes the logger
-writer.close()
+# %%
+compare(eval_reports).to_csv("comparing.csv")
