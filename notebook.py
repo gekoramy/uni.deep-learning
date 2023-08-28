@@ -80,9 +80,6 @@ torch.use_deterministic_algorithms(False)  # CLIP uses non-deterministic algorit
 g: torch.Generator = torch.Generator(device=device).manual_seed(42)
 
 # %% [markdown]
-# #### Utils
-
-# %% [markdown]
 # #### Dataset and type declaration
 
 # %%
@@ -217,13 +214,13 @@ class CocoDataset(
             for sents in [id2sents[ref.ref_id]]
             for bboxes in [img2bboxes[ref.file_name]]
             for xyxys in [
-                torch.tensor(
-                    [
-                        (bbox.xmin, bbox.ymin, bbox.xmax, bbox.ymax)
-                        for bbox in bboxes
-                        if bbox.confidence > 0.25  # ensure at least .25 confidence
-                    ]
-                )
+                torch.tensor([
+                    (bbox.xmin, bbox.ymin, bbox.xmax, bbox.ymax)
+                    for bbox in bboxes
+                    if bbox.confidence > .25  # lower bound on confidence
+                    if bbox.xmax - bbox.xmin > 16  # lower bound on width
+                    if bbox.ymax - bbox.ymin > 16  # lower bound on heigth
+                ])
             ]
             for xyxy in [torch.tensor([(ref.xmin, ref.ymin, ref.xmax, ref.ymax)])]
         ]
@@ -312,11 +309,13 @@ class ClipFlypCore(nn.Module):
         self.img_encoder = nn.Sequential(
             clip_freezed_img_encoder,
             nn.ReLU(),
+            nn.Dropout(.5),
             nn.Linear(1024, 1024),
         )
         self.txt_encoder = nn.Sequential(
             clip_freezed_txt_encoder,
             nn.ReLU(),
+            nn.Dropout(.5),
             nn.Linear(1024, 1024),
         )
         # the temperature parameter is added as suggested by the original paper in order to prevent training instability
@@ -356,15 +355,12 @@ def transform(n_px: int) -> Compose:
     """
     https://github.com/openai/CLIP/blob/a1d071733d7111c9c014f024669f959182114e33/clip/clip.py#L75-L86
     """
-    return Compose(
-        [
-            ConvertImageDtype(torch.float),
-            Resize(n_px, interpolation=InterpolationMode.BICUBIC, antialias=True),
-            CenterCrop(n_px),
-            Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
-        ]
-    )
-
+    return Compose([
+        ConvertImageDtype(torch.float),
+        Resize(n_px, interpolation=InterpolationMode.BICUBIC, antialias=True),
+        CenterCrop(n_px),
+        Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
+    ])
 
 preprocess: Compose = transform(224)
 
@@ -503,75 +499,80 @@ def test_step(
 # %%
 def training_showtime(
     model: ClipFlyp,
-    data_loader: DataLoader[tuple[TensorImage, list[str]]],
+    spli2loader: dict[Split, DataLoader[tuple[TensorImage, list[str]]]],
     writer: SummaryWriter,
     global_step: int,
 ) -> None:
     model.eval()
 
-    progress = tqdm(data_loader, desc=f"showtime")
-
     with torch.inference_mode():
-        entries: tuple[tuple[TensorImage, list[str]], ...]
-        entry: tuple[TensorImage, list[str]]
 
-        for iter, entries in zip(it.count(1), progress):
-            # forward computation
-            imgs_features, txts_features, _ = model(
-                [(img, prompts[0]) for img, prompts in entries]
-            )
+        for split, data_loader in spli2loader.items():
 
-            imgs_features: Float[torch.Tensor, "entries 1024"] = imgs_features / imgs_features.norm(dim=-1, keepdim=True)
-            txts_features: Float[torch.Tensor, "entries 1024"] = txts_features / txts_features.norm(dim=-1, keepdim=True)
-            similarity: Float[torch.Tensor, "entries entries"] = (txts_features @ imgs_features.T).cpu()
+            progress = tqdm(data_loader, desc=f"showtime [{split}]")
 
-            f: plt.Figure
-            ax: plt.Axes
-            f, ax = plt.subplots(1, 1, figsize=(10, 8))
+            entries: tuple[tuple[TensorImage, list[str]], ...]
+            entry: tuple[TensorImage, list[str]]
 
-            ax.imshow(similarity, vmin=0.1, vmax=0.3)
+            for iter, entries in zip(it.count(1), progress):
 
-            ax.set_yticks(
-                range(len(entries)),
-                ["\n".join(prompts) for _, prompts in entries],
-                fontsize=10,
-            )
-            ax.set_xticks([])
+                # forward computation
+                imgs_features, txts_features, _ = model([
+                    (img, prompts[0])
+                    for img, prompts in entries
+                ])
 
-            for i, image in enumerate([crop for crop, _ in entries]):
-                ax.imshow(
-                    image.permute(1, 2, 0).cpu(),
-                    extent=(i - 0.5, i + 0.5, -1.6, -0.6),
-                    origin="lower",
+                imgs_features: Float[torch.Tensor, "entries 1024"] = imgs_features / imgs_features.norm(dim=-1, keepdim=True)
+                txts_features: Float[torch.Tensor, "entries 1024"] = txts_features / txts_features.norm(dim=-1, keepdim=True)
+                similarity: Float[torch.Tensor, "entries entries"] = (txts_features @ imgs_features.T).cpu()
+
+                f: plt.Figure
+                ax: plt.Axes
+                f, ax = plt.subplots(1, 1, figsize=(10, 8))
+
+                ax.imshow(similarity, vmin=torch.min(similarity).item(), vmax=torch.max(similarity).item())
+
+                ax.set_yticks(
+                    range(len(entries)),
+                    ["\n".join(prompts) for _, prompts in entries],
+                    fontsize=10,
                 )
+                ax.set_xticks([])
 
-            for x in range(similarity.shape[1]):
-                for y in range(similarity.shape[0]):
-                    ax.text(
-                        x,
-                        y,
-                        f"{similarity[y, x]:.2f}",
-                        ha="center",
-                        va="center",
-                        size=12,
+                for i, image in enumerate([ crop for crop, _ in entries ]):
+                    ax.imshow(
+                        image.permute(1, 2, 0).cpu(),
+                        extent=(i - 0.5, i + 0.5, -1.6, -0.6),
+                        origin="lower",
                     )
 
-            for side in ["left", "top", "right", "bottom"]:
-                f.gca().spines[side].set_visible(False)
+                for x in range(similarity.shape[1]):
+                    for y in range(similarity.shape[0]):
+                        ax.text(
+                            x,
+                            y,
+                            f"{similarity[y, x]:.2f}",
+                            ha="center",
+                            va="center",
+                            size=12,
+                        )
 
-            ax.set_xlim([-0.5, len(entries) - 0.5])
-            ax.set_ylim([len(entries) + 0.5, -2])
+                for side in ["left", "top", "right", "bottom"]:
+                    f.gca().spines[side].set_visible(False)
 
-            f.tight_layout()
+                ax.set_xlim([-0.5, len(entries) - 0.5])
+                ax.set_ylim([len(entries) + 0.5, -2])
 
-            writer.add_figure(tag=f"matrix {iter}", figure=f, global_step=global_step)
+                f.tight_layout()
+
+                writer.add_figure(tag=f"matrix {iter}/{split}", figure=f, global_step=global_step)
 
 
 # %%
-BATCH_SIZE: int = 1024
-LIMIT: int = 2  # (20_000 // BATCH_SIZE) * BATCH_SIZE
+BATCH_SIZE: int = 6
+LIMIT: int = 1 * BATCH_SIZE  # (5_000 // BATCH_SIZE) * BATCH_SIZE
 NUM_WORKERS: int = 0  # os.cpu_count() or 1
-EPOCHS: int = 1
+EPOCHS: int = 50
 
 # %%
 split2loader: dict[Split, DataLoader[tuple[TensorImage, list[str]]]] = {
@@ -586,14 +587,16 @@ split2loader: dict[Split, DataLoader[tuple[TensorImage, list[str]]]] = {
     for split in ["train", "val", "test"]
 }
 
-training_showtime_dataloader: DataLoader[tuple[TensorImage, list[str]]] = DataLoader(
-    dataset=Coco4ClipDataset(split="test", limit=5 * 6),
-    generator=g,
-    batch_size=6,
-    num_workers=NUM_WORKERS,
-    collate_fn=lambda x: x,
-    shuffle=False,
-)
+split2showtime_dataloader: dict[Split, DataLoader[tuple[TensorImage, list[str]]]] = {
+    split: DataLoader(
+        dataset=Coco4ClipDataset(split=split, limit=5 * 6),
+        batch_size=6,
+        num_workers=NUM_WORKERS,
+        collate_fn=lambda x: x,
+        shuffle=False,
+    )
+    for split in ['train', 'val', 'test']
+}
 
 
 # %%
@@ -621,10 +624,10 @@ def training_loop(
         loss["val"].append(val_loss)
 
         training_showtime(
-            model=model,
-            data_loader=training_showtime_dataloader,
-            writer=writer,
-            global_step=0,
+            model,
+            split2showtime_dataloader,
+            writer,
+            0
         )
 
         # log to TensorBoard
@@ -671,6 +674,9 @@ def training_loop(
                 refresh=False,
             )
 
+            # store model
+            torch.save(obj=model.state_dict(), f=f"{name}-{(epoch + 1):02d}.pth")
+
         # compute final evaluation results
         print("After training:")
 
@@ -682,10 +688,10 @@ def training_loop(
         loss["test"].append(test_loss)
 
         training_showtime(
-            model=model,
-            data_loader=training_showtime_dataloader,
-            writer=writer,
-            global_step=EPOCHS,
+            model,
+            split2showtime_dataloader,
+            writer,
+            EPOCHS
         )
 
         # log to TensorBoard
@@ -697,16 +703,16 @@ def training_loop(
             global_step=EPOCHS,
         )
 
-        return pd.DataFrame(
-            {
-                "loss": [
-                    pd.concat(
-                        [pd.Series(v).describe() for v in loss.values()],
-                        axis=1,
-                        keys=[k for k in loss.keys()],
-                    )
-                ]
-            }
+        return pd.concat(
+            [
+                pd.concat(
+                    [pd.Series(v).describe() for v in loss.values()],
+                    axis=1,
+                    keys=[k for k in loss.keys()],
+                ),
+            ],
+            axis=1,
+            keys=["loss"],
         )
 
 
@@ -719,12 +725,9 @@ model: ClipFlyp = ClipFlyp().to(device)
 report: pd.DataFrame = training_loop(
     name=name,
     model=model,
-    optimizer=lambda params: torch.optim.SGD(params=params, lr=1e-2, weight_decay=1e-6, momentum=0.9),
+    optimizer=lambda params: torch.optim.SGD(params=params, lr=.01, weight_decay=1e-6, momentum=.9),
 )
 report.to_csv(f"training-{name}.csv")
-
-# %%
-torch.save(obj=model.state_dict(), f=f"{name}.pth")
 
 
 # %% [markdown]
@@ -936,12 +939,8 @@ def eval_step(
             iou: float = box_iou(true_xyxy, pred_xyxy).item()
             ious.append(iou)
 
-            true_z: Float[torch.Tensor, "1 1024"] = clip_freezed_img_encoder(
-                img_preprocess(true_crop).unsqueeze(0)
-            )
-            pred_z: Float[torch.Tensor, "1 1024"] = clip_freezed_img_encoder(
-                img_preprocess(crops[pred_i]).unsqueeze(0)
-            )
+            true_z: Float[torch.Tensor, "1 1024"] = clip_freezed_img_encoder(img_preprocess(true_crop).unsqueeze(0))
+            pred_z: Float[torch.Tensor, "1 1024"] = clip_freezed_img_encoder(img_preprocess(crops[pred_i]).unsqueeze(0))
 
             cos: float = torch.nn.functional.cosine_similarity(true_z, pred_z).item()
             coss.append(cos)
