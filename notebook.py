@@ -195,29 +195,17 @@ class Coco4ClipDataset(Dataset[tuple[TensorImage, list[str]]]):
 # # Image augmentation
 
 # %%
-transform: RandomChoice = RandomChoice(
-    [
-        ColorJitter(
-            brightness=0.5, hue=0.3
-        ),  # randomly changes the brightness, saturation, and other properties of an image
-        GaussianBlur(
-            kernel_size=(5, 9), sigma=(0.1, 5)
-        ),  # performs gaussian blur transform on an image
-        RandomInvert(),  # randomly inverts the colors of the given image
-        RandomPosterize(
-            bits=2
-        ),  # randomly posterizes the image by reducing the number of bits of each color channel
-        RandomSolarize(
-            threshold=192.0
-        ),  # randomly solarizes the image by inverting all pixel values above the threshold
-        RandomAdjustSharpness(
-            sharpness_factor=2
-        ),  # randomly adjusts the sharpness of the given image
-        RandomAutocontrast(),  # randomly applies autocontrast to the given image
-        RandomEqualize(),  # randomly equalizes the histogram of the given image
-        Grayscale(num_output_channels=3),  # converts an image to grayscale
-    ]
-)
+transform: RandomChoice = RandomChoice([
+    ColorJitter(brightness=0.5, hue=0.3),  # randomly changes the brightness, saturation, and other properties of an image
+    GaussianBlur(kernel_size=(5, 9), sigma=(0.1, 5)),  # performs gaussian blur transform on an image
+    RandomInvert(),  # randomly inverts the colors of the given image
+    RandomPosterize(bits=2),  # randomly posterizes the image by reducing the number of bits of each color channel
+    RandomSolarize(threshold=192.0),  # randomly solarizes the image by inverting all pixel values above the threshold
+    RandomAdjustSharpness(sharpness_factor=2),  # randomly adjusts the sharpness of the given image
+    RandomAutocontrast(),  # randomly applies autocontrast to the given image
+    RandomEqualize(),  # randomly equalizes the histogram of the given image
+    Grayscale(num_output_channels=3),  # converts an image to grayscale
+])
 
 # %%
 for _, (c, prompt) in zip(range(5), Coco4ClipDataset("test")):
@@ -256,9 +244,7 @@ from transformers import PegasusForConditionalGeneration, PegasusTokenizer
 
 pegasus_model_name = "tuner007/pegasus_paraphrase"
 pegasus_tokenizer = PegasusTokenizer.from_pretrained(pegasus_model_name)
-pegasus_model = PegasusForConditionalGeneration.from_pretrained(pegasus_model_name).to(
-    device
-)
+pegasus_model = PegasusForConditionalGeneration.from_pretrained(pegasus_model_name).to(device)
 
 pegasus_model.eval()
 
@@ -305,9 +291,7 @@ def pegasus(txt: str) -> str:
 # %%
 def bart(txt: str) -> str:
     with torch.inference_mode():
-        batch: dict[str, Int[torch.Tensor, "1 P"]] = bart_tokenizer(
-            txt, return_tensors="pt"
-        )
+        batch: dict[str, Int[torch.Tensor, "1 P"]] = bart_tokenizer(txt, return_tensors="pt")
         translated: Int[torch.Tensor, "1 X"] = bart_model.generate(batch["input_ids"])
         [out] = bart_tokenizer.batch_decode(translated, skip_special_tokens=True)
         return out
@@ -317,18 +301,16 @@ def bart(txt: str) -> str:
 eda: EDA = EDA(random_state=42)
 
 # %%
-txt_transform: RandomChoice = RandomChoice(
-    [
-        "A photo of {}".format,
-        "A picture of {}".format,
-        "An image of {}".format,
-        "This is {}".format,
-        "We can see {}".format,
-        eda.synonym_replacement,
-        pegasus,
-        bart,
-    ]
-)
+txt_transform: RandomChoice = RandomChoice([
+    "A photo of {}".format,
+    "A picture of {}".format,
+    "An image of {}".format,
+    "This is {}".format,
+    "We can see {}".format,
+    eda.synonym_replacement,
+    pegasus,
+    bart,
+])
 
 # %%
 for _, (c, prompts) in zip(range(5), Coco4ClipDataset("test")):
