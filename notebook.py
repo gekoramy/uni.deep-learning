@@ -309,13 +309,13 @@ class ClipFlypCore(nn.Module):
         self.img_encoder = nn.Sequential(
             clip_freezed_img_encoder,
             nn.ReLU(),
-            nn.Dropout(.5),
+            nn.Dropout(.25),
             nn.Linear(1024, 1024),
         )
         self.txt_encoder = nn.Sequential(
             clip_freezed_txt_encoder,
             nn.ReLU(),
-            nn.Dropout(.5),
+            nn.Dropout(.25),
             nn.Linear(1024, 1024),
         )
         # the temperature parameter is added as suggested by the original paper in order to prevent training instability
@@ -725,7 +725,7 @@ model: ClipFlyp = ClipFlyp().to(device)
 report: pd.DataFrame = training_loop(
     name=name,
     model=model,
-    optimizer=lambda params: torch.optim.SGD(params=params, lr=.01, weight_decay=1e-6, momentum=.9),
+    optimizer=lambda params: torch.optim.Adam(params=params, lr=.00043, weight_decay=.01),
 )
 report.to_csv(f"training-{name}.csv")
 
