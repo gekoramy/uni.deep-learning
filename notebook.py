@@ -34,8 +34,8 @@ import numpy as np
 import PIL
 import itertools as it
 import math
-import matplotlib.pyplot as plt # added in this notebook
-import random # added in this notebook
+import matplotlib.pyplot as plt  # added in this notebook
+import random  # added in this notebook
 
 from datetime import datetime
 from jaxtyping import Float, UInt, Int
@@ -52,7 +52,7 @@ from timeit import default_timer as timer
 from torch.utils.tensorboard import SummaryWriter
 
 # %%
-device: Literal['cpu', 'cuda'] = 'cuda' if torch.cuda.is_available() else 'cpu'
+device: Literal["cpu", "cuda"] = "cuda" if torch.cuda.is_available() else "cpu"
 torch.set_default_device(device)
 device
 
@@ -84,6 +84,7 @@ Img = UInt[torch.Tensor, "C W H"]
 BBox = UInt[torch.Tensor, "4"]
 Split = Literal["train", "test", "val"]
 
+
 @dataclass
 class Info:
     description: str  # This is stable 1.0 version of the 2014 MS COCO dataset.
@@ -92,6 +93,7 @@ class Info:
     year: int  # 2014
     contributor: str  # Microsoft COCO group
     date_created: datetime  # 2015-01-27 09:11:52.357475
+
 
 @dataclass
 class Image:
@@ -104,11 +106,13 @@ class Image:
     id: int  # id of the imag
     date_captured: datetime  # example '2013-11-21 01:03:06'
 
+
 @dataclass
 class License:
     url: str  # example http://creativecommons.org/licenses/by-nc-sa/2.0/
     id: int  # id of the licence
     name: str  # example 'Attribution-NonCommercial-ShareAlike License
+
 
 @dataclass
 class Annotation:
@@ -124,11 +128,13 @@ class Annotation:
     category_id: int
     id: int  # annotation id
 
+
 @dataclass
 class Category:
     supercategory: str  # example 'vehicle'
     id: int  # category id
     name: str  # example 'airplane'
+
 
 @dataclass
 class Instances:
@@ -138,12 +144,14 @@ class Instances:
     annotations: list[Annotation]
     categories: list[Category]
 
+
 @dataclass
 class Sentence:
     tokens: list[str]  # tokenized version of referring expression
     raw: str  # unprocessed referring expression
     sent: str  # referring expression with mild processing, lower case, spell correction, etc.
     sent_id: int  # unique referring expression id
+
 
 @dataclass
 class Ref:
@@ -204,7 +212,9 @@ class CocoDataset(Dataset[tuple[PIL.Image, list[str], Float[torch.Tensor, "4"]]]
             if ref.split == split
             for i in [os.path.join(data_images, ref.file_name)]
             for ss in [ref.sentences]
-            for xywh in [torch.tensor(id2annotation[ref.ann_id].bbox, dtype=torch.float)]
+            for xywh in [
+                torch.tensor(id2annotation[ref.ann_id].bbox, dtype=torch.float)
+            ]
         ]
         self.len: int = len(self.items) if limit < 0 else min(limit, len(self.items))
 
@@ -215,7 +225,9 @@ class CocoDataset(Dataset[tuple[PIL.Image, list[str], Float[torch.Tensor, "4"]]]
         self, index: int
     ) -> tuple[PIL.Image, list[str], Float[torch.Tensor, "4"]]:
         i, ps, xywh = self.items[index]
-        xyxy: Float[torch.Tensor, "4"] = torchvision.ops.box_convert(xywh, in_fmt="xywh", out_fmt="xyxy")
+        xyxy: Float[torch.Tensor, "4"] = torchvision.ops.box_convert(
+            xywh, in_fmt="xywh", out_fmt="xyxy"
+        )
         with PIL.Image.open(i) as img:
             img.load()
             return img, ps, xyxy
@@ -231,7 +243,9 @@ batch_size: int = 3
 limit: int = 5 * batch_size
 
 # %%
-dl: DataLoader[tuple[list[PIL.Image], list[list[str]], list[Float[torch.Tensor, "4"]]]] = DataLoader(
+dl: DataLoader[
+    tuple[list[PIL.Image], list[list[str]], list[Float[torch.Tensor, "4"]]]
+] = DataLoader(
     dataset=CocoDataset(split="test", limit=limit),
     batch_size=batch_size,
     collate_fn=unzip,
@@ -255,47 +269,67 @@ for imgs, promptss, true_xyxy in dl:
 # %%
 class RandomChoice(torch.nn.Module):
     def __init__(self, transforms):
-       super().__init__()
-       self.transforms = transforms
+        super().__init__()
+        self.transforms = transforms
 
     def __call__(self, imgs):
         return [random.choice(self.transforms)(img) for img in imgs]
 
 
 # %%
-transform = RandomChoice([
-      transforms.ColorJitter(brightness=.5, hue=.3),                # randomly changes the brightness, saturation, and other properties of an image
-      transforms.GaussianBlur(kernel_size=(5, 9), sigma=(0.1, 5)),  # performs gaussian blur transform on an image
-      transforms.RandomInvert(),                                    # randomly inverts the colors of the given image
-      transforms.RandomPosterize(bits=2),                           # randomly posterizes the image by reducing the number of bits of each color channel
-      transforms.RandomSolarize(threshold=192.0),                   # randomly solarizes the image by inverting all pixel values above the threshold
-      transforms.RandomAdjustSharpness(sharpness_factor=2),         # randomly adjusts the sharpness of the given image
-      transforms.RandomAutocontrast(),                              # randomly applies autocontrast to the given image
-      transforms.RandomEqualize(),                                  # randomly equalizes the histogram of the given image
-      transforms.Grayscale(num_output_channels=3)                   # converts an image to grayscale
-    ])
+transform = RandomChoice(
+    [
+        transforms.ColorJitter(
+            brightness=0.5, hue=0.3
+        ),  # randomly changes the brightness, saturation, and other properties of an image
+        transforms.GaussianBlur(
+            kernel_size=(5, 9), sigma=(0.1, 5)
+        ),  # performs gaussian blur transform on an image
+        transforms.RandomInvert(),  # randomly inverts the colors of the given image
+        transforms.RandomPosterize(
+            bits=2
+        ),  # randomly posterizes the image by reducing the number of bits of each color channel
+        transforms.RandomSolarize(
+            threshold=192.0
+        ),  # randomly solarizes the image by inverting all pixel values above the threshold
+        transforms.RandomAdjustSharpness(
+            sharpness_factor=2
+        ),  # randomly adjusts the sharpness of the given image
+        transforms.RandomAutocontrast(),  # randomly applies autocontrast to the given image
+        transforms.RandomEqualize(),  # randomly equalizes the histogram of the given image
+        transforms.Grayscale(num_output_channels=3),  # converts an image to grayscale
+    ]
+)
 
 # %%
 torch.manual_seed(42)
 
+
 def display_images(images, titles, rows, cols):
-  fig, axes = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3))
-  for i, ax in enumerate(axes.flatten()):
-      ax.imshow(images[i])
-      ax.set_title(titles[i]+str(images[i].size))
-      ax.axis('off')
-  plt.tight_layout()
-  plt.show()
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3))
+    for i, ax in enumerate(axes.flatten()):
+        ax.imshow(images[i])
+        ax.set_title(titles[i] + str(images[i].size))
+        ax.axis("off")
+    plt.tight_layout()
+    plt.show()
+
 
 for imgs, promptss, true_xyxy in dl:
-
     transformed_images = transform(imgs)
 
     display_images(
-      images=list(imgs) + transformed_images,
-      titles=['Original Image 1', 'Original Image 2', 'Original Image 3', 'Transformed Image 1', 'Transformed Image 2', 'Transformed Image 3'],
-      rows=2,
-      cols=3
+        images=list(imgs) + transformed_images,
+        titles=[
+            "Original Image 1",
+            "Original Image 2",
+            "Original Image 3",
+            "Transformed Image 1",
+            "Transformed Image 2",
+            "Transformed Image 3",
+        ],
+        rows=2,
+        cols=3,
     )
 
 # %% [markdown]
@@ -316,27 +350,43 @@ except ModuleNotFoundError:
     # !pip install textaugment
     from textaugment import EDA
 
-import nltk # NLTK is a leading platform for building Python programs to work with human language data
-nltk.download('stopwords')
-nltk.download('wordnet')
+import nltk  # NLTK is a leading platform for building Python programs to work with human language data
+
+nltk.download("stopwords")
+nltk.download("wordnet")
 
 # %%
 # PEGASUS fine-tuned for paraphrasing
 # paper: https://arxiv.org/abs/1912.08777
 # code reference: https://huggingface.co/tuner007/pegasus_paraphrase
 from transformers import PegasusForConditionalGeneration, PegasusTokenizer
-pegasus_model_name = 'tuner007/pegasus_paraphrase'
+
+pegasus_model_name = "tuner007/pegasus_paraphrase"
 pegasus_torch_device = device
 pegasus_tokenizer = PegasusTokenizer.from_pretrained(pegasus_model_name)
-pegasus_model = PegasusForConditionalGeneration.from_pretrained(pegasus_model_name).to(pegasus_torch_device)
+pegasus_model = PegasusForConditionalGeneration.from_pretrained(pegasus_model_name).to(
+    pegasus_torch_device
+)
 
 
 # %%
-def pegasus_get_response(input_text,num_return_sequences=1,num_beams=10):
-  batch = pegasus_tokenizer([input_text],truncation=True,padding='longest',max_length=60, return_tensors="pt").to(pegasus_torch_device)
-  translated = pegasus_model.generate(**batch,max_length=60,num_beams=num_beams, num_return_sequences=num_return_sequences, temperature=1.5)
-  tgt_text = pegasus_tokenizer.batch_decode(translated, skip_special_tokens=True)
-  return tgt_text
+def pegasus_get_response(input_text, num_return_sequences=1, num_beams=10):
+    batch = pegasus_tokenizer(
+        [input_text],
+        truncation=True,
+        padding="longest",
+        max_length=60,
+        return_tensors="pt",
+    ).to(pegasus_torch_device)
+    translated = pegasus_model.generate(
+        **batch,
+        max_length=60,
+        num_beams=num_beams,
+        num_return_sequences=num_return_sequences,
+        temperature=1.5
+    )
+    tgt_text = pegasus_tokenizer.batch_decode(translated, skip_special_tokens=True)
+    return tgt_text
 
 
 # %%
@@ -344,70 +394,73 @@ def pegasus_get_response(input_text,num_return_sequences=1,num_beams=10):
 # paper: https://arxiv.org/abs/1910.13461
 # code reference: https://huggingface.co/eugenesiow/bart-paraphrase
 from transformers import BartForConditionalGeneration, BartTokenizer
-bart_model = BartForConditionalGeneration.from_pretrained('eugenesiow/bart-paraphrase')
+
+bart_model = BartForConditionalGeneration.from_pretrained("eugenesiow/bart-paraphrase")
 bart_torch_device = device
 bart_model = bart_model.to(bart_torch_device)
-bart_tokenizer = BartTokenizer.from_pretrained('eugenesiow/bart-paraphrase')
+bart_tokenizer = BartTokenizer.from_pretrained("eugenesiow/bart-paraphrase")
 
 
 # %%
 class TextAugmentation(torch.nn.Module):
-  def __init__(self):
-    super().__init__()
-    self.eda_transformation = EDA(random_state=1)  # EDA initialization
+    def __init__(self):
+        super().__init__()
+        self.eda_transformation = EDA(random_state=1)  # EDA initialization
 
-    self.transforms = [
-        self.eda_synonym_replacement,
-        self.template_insertion("A photo of {}"),
-        self.template_insertion("A picture of {}"),
-        self.template_insertion("An image of {}"),
-        self.template_insertion("This is {}"),
-        self.template_insertion("We can see {}"),
-        self.pegasus_augmentation,
-        self.bert_augmentation
-    ]
+        self.transforms = [
+            self.eda_synonym_replacement,
+            self.template_insertion("A photo of {}"),
+            self.template_insertion("A picture of {}"),
+            self.template_insertion("An image of {}"),
+            self.template_insertion("This is {}"),
+            self.template_insertion("We can see {}"),
+            self.pegasus_augmentation,
+            self.bert_augmentation,
+        ]
 
-  # randomly choose n words from the sentence that are not stop words. Replace each of these words with one of its synonyms chosen at random
-  def eda_synonym_replacement(self, txt):
-    return self.eda_transformation.synonym_replacement(txt)
+    # randomly choose n words from the sentence that are not stop words. Replace each of these words with one of its synonyms chosen at random
+    def eda_synonym_replacement(self, txt):
+        return self.eda_transformation.synonym_replacement(txt)
 
-  # add a template as suggested by the CLIP paper. Examples: A photo of {}, We can see {}, ...
-  def template_insertion(self, template):
-    return template.format
+    # add a template as suggested by the CLIP paper. Examples: A photo of {}, We can see {}, ...
+    def template_insertion(self, template):
+        return template.format
 
-  # pegasus paraphrasing
-  def pegasus_augmentation(self, txt):
-    return pegasus_get_response(txt)[0]
+    # pegasus paraphrasing
+    def pegasus_augmentation(self, txt):
+        return pegasus_get_response(txt)[0]
 
-  # bert paraphrasing
-  def bert_augmentation(self, txt):
-    batch = bart_tokenizer(txt, return_tensors='pt')
-    generated_ids = bart_model.generate(batch['input_ids'])
-    generated_sentence = bart_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
-    return generated_sentence[0]
+    # bert paraphrasing
+    def bert_augmentation(self, txt):
+        batch = bart_tokenizer(txt, return_tensors="pt")
+        generated_ids = bart_model.generate(batch["input_ids"])
+        generated_sentence = bart_tokenizer.batch_decode(
+            generated_ids, skip_special_tokens=True
+        )
+        return generated_sentence[0]
 
-  def __call__(self, txts):
-      return [random.choice(self.transforms)(txt) for txt in txts]
+    def __call__(self, txts):
+        return [random.choice(self.transforms)(txt) for txt in txts]
 
 
 # %%
 torch.manual_seed(42)
 text_transform = TextAugmentation()
 for imgs, promptss, true_xyxy in dl:
-  print("ORIGINAL PROMPTS")
-  for prompts in promptss:
-    for prompt in prompts:
-      print(prompt)
+    print("ORIGINAL PROMPTS")
+    for prompts in promptss:
+        for prompt in prompts:
+            print(prompt)
 
-  print("====\n")
+    print("====\n")
 
-  print("TRANSFORMED")
-  for prompts in promptss:
-    transformed_prompts = text_transform(prompts)
-    for prompt in transformed_prompts:
-      print(prompt)
+    print("TRANSFORMED")
+    for prompts in promptss:
+        transformed_prompts = text_transform(prompts)
+        for prompt in transformed_prompts:
+            print(prompt)
 
-  print("\nEND BATCH\n")
+    print("\nEND BATCH\n")
 
 # %% [markdown]
 # ### ChatGPT experiments
