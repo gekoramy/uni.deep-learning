@@ -1,5 +1,11 @@
-# %% [markdown]
-# <a href="https://colab.research.google.com/github/gekoramy/uni.deep-learning/blob/data-augmentation/notebook.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
+# %%
+# %%shell
+if ! [ -d dataset ]; then
+  mkdir dataset &&
+  gdown 1i-LHWSRp2F6--yhAi4IG3DiiCHmgE4cw &&
+  tar -xf refcocog.tar -C dataset &&
+  rm refcocog.tar
+fi
 
 # %%
 # %%shell
@@ -8,347 +14,234 @@ ftfy
 jaxtyping
 jupyter
 matplotlib
+pandas
 pydantic
 regex
+sentencepiece
+tensorboard
+textaugment
 torch
 torchinfo
 torchvision
 tqdm
-ultralytics
+transformers
 END
 
 pip install -q -r requirements.txt
 pip install -q git+https://github.com/openai/CLIP.git
 
 # %%
-import clip
-import json
-import os
-import pickle
-import re
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torchvision
-import numpy as np
-import PIL
+import csv
+import doctest
 import itertools as it
 import math
-import matplotlib.pyplot as plt  # added in this notebook
-import random  # added in this notebook
+import os
+import typing as t
+import random
 
-from datetime import datetime
+import clip
+import pandas as pd
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+
+from collections import defaultdict
 from jaxtyping import Float, UInt, Int
 from pydantic.dataclasses import dataclass
-from torch.utils.data import DataLoader
-from torch.utils.data import Dataset
-from torchvision import transforms
-from torchvision.utils import draw_bounding_boxes
-from torchvision.io import read_image
-from torchinfo import summary
-from typing import Literal, Callable, Mapping, TypeVar
-from tqdm import tqdm
-from timeit import default_timer as timer
+from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
+from torchinfo import summary
+from torchvision.io import read_image, ImageReadMode
+from torchvision.ops import box_iou, box_convert
+from torchvision.transforms import (
+    Compose,
+    Resize,
+    CenterCrop,
+    Normalize,
+    InterpolationMode,
+    ConvertImageDtype,
+    ColorJitter,
+    GaussianBlur,
+    RandomChoice,
+    RandomInvert,
+    RandomPosterize,
+    RandomSolarize,
+    RandomAdjustSharpness,
+    RandomAutocontrast,
+    RandomEqualize,
+    Grayscale,
+)
+from torchvision.transforms.functional import crop
+from tqdm.auto import tqdm, trange
 
 # %%
-device: Literal["cpu", "cuda"] = "cuda" if torch.cuda.is_available() else "cpu"
+device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.set_default_device(device)
-device
+
+# %%
+# setting a manual seed allow us to provide reprudicible results in this notebook
+# https://pytorch.org/docs/stable/notes/randomness.html
+
+torch.manual_seed(42)
+torch.cuda.manual_seed_all(42)
+torch.use_deterministic_algorithms(False)  # CLIP uses non-deterministic algorithms
+g: torch.Generator = torch.Generator(device=device).manual_seed(42)
+random.seed(42)
 
 # %% [markdown]
 # ## Dataset preparation
 
 # %%
-# %%shell
-if ! [ -d dataset ]; then
-  mkdir dataset &&
-  gdown 1P8a1g76lDJ8cMIXjNDdboaRR5-HsVmUb &&
-  tar -xf refcocog.tar.gz -C dataset &&
-  rm refcocog.tar.gz
-fi
+path_root: str = os.path.join("dataset", "refcocog", "")
+path_annotations: str = os.path.join(path_root, "annotations", "")
+path_bboxes: str = os.path.join(path_root, "bboxes", "")
+path_images: str = os.path.join(path_root, "images", "")
+
+path_refs: str = os.path.join(path_annotations, "refs.csv")
+path_sentences: str = os.path.join(path_annotations, "sentences.csv")
+
+path_DETR: str = os.path.join(path_bboxes, "bboxes[DETR].csv")
+path_YOLOv5: str = os.path.join(path_bboxes, "bboxes[YOLOv5].csv")
+path_YOLOv8: str = os.path.join(path_bboxes, "bboxes[YOLOv8].csv")
 
 # %%
-root = os.path.join("dataset", "refcocog", "")
-data_instances = os.path.join(root, "annotations", "instances.json")
-data_refs = os.path.join(root, "annotations", "refs(umd).p")
-data_images = os.path.join(root, "images", "")
-
-# %%
-I = TypeVar("I")
-P = TypeVar("P")
-B = TypeVar("B")
-T = TypeVar("T")
-
-Img = UInt[torch.Tensor, "C W H"]
-BBox = UInt[torch.Tensor, "4"]
-Split = Literal["train", "test", "val"]
-
-
-@dataclass
-class Info:
-    description: str  # This is stable 1.0 version of the 2014 MS COCO dataset.
-    url: str  # http://mscoco.org/
-    version: str  # 1.0
-    year: int  # 2014
-    contributor: str  # Microsoft COCO group
-    date_created: datetime  # 2015-01-27 09:11:52.357475
-
-
-@dataclass
-class Image:
-    license: int  # each image has an associated licence id
-    file_name: str  # file name of the image
-    coco_url: str  # example http://mscoco.org/images/131074
-    height: int
-    width: int
-    flickr_url: str  # example http://farm9.staticflickr.com/8308/7908210548_33e
-    id: int  # id of the imag
-    date_captured: datetime  # example '2013-11-21 01:03:06'
-
-
-@dataclass
-class License:
-    url: str  # example http://creativecommons.org/licenses/by-nc-sa/2.0/
-    id: int  # id of the licence
-    name: str  # example 'Attribution-NonCommercial-ShareAlike License
-
-
-@dataclass
-class Annotation:
-    # segmentation: list[list[float]]  # description of the mask; example [[44.17, 217.83, 36.21, 219.37, 33.64, 214.49, 31.08, 204.74, 36.47, 202.68, 44.17, 203.2]]
-    area: float  # number of pixel of the described object
-    iscrowd: Literal[
-        1, 0
-    ]  # Crowd annotations (iscrowd=1) are used to label large groups of objects (e.g. a crowd of people)
-    image_id: int  # id of the target image
-    bbox: tuple[
-        float, float, float, float
-    ]  # bounding box coordinates [xmin, ymin, width, height]
-    category_id: int
-    id: int  # annotation id
-
-
-@dataclass
-class Category:
-    supercategory: str  # example 'vehicle'
-    id: int  # category id
-    name: str  # example 'airplane'
-
-
-@dataclass
-class Instances:
-    info: Info
-    images: list[Image]
-    licenses: list[License]
-    annotations: list[Annotation]
-    categories: list[Category]
-
-
-@dataclass
-class Sentence:
-    tokens: list[str]  # tokenized version of referring expression
-    raw: str  # unprocessed referring expression
-    sent: str  # referring expression with mild processing, lower case, spell correction, etc.
-    sent_id: int  # unique referring expression id
+Split = t.Literal["train", "test", "val"]
 
 
 @dataclass
 class Ref:
-    image_id: int  # unique image id
-    split: Split
-    sentences: list[Sentence]
-    file_name: str  # file name of image relative to img_root
-    category_id: int  # object category label
-    ann_id: int  # id of object annotation in instance.json
-    sent_ids: list[int]  # same ids as nested sentences[...][sent_id]
     ref_id: int  # unique id for refering expression
+    file_name: str  # file name of image relative to img_root
+    split: Split
+    xmin: float
+    ymin: float
+    xmax: float
+    ymax: float
+
+
+with open(path_refs, "r") as f:
+    raw = csv.DictReader(f)
+    refs: list[Ref] = [Ref(**row) for row in raw]
+
+# %%
+T = t.TypeVar("T")
+K = t.TypeVar("K")
+V = t.TypeVar("V")
+
+
+def groupby(
+    xs: list[T],
+    map_key: t.Callable[[T], K],
+    map_value: t.Callable[[T], V] = lambda x: x,
+) -> dict[K, list[V]]:
+    return {
+        k: [map_value(v) for v in vs]
+        for k, vs in it.groupby(sorted(xs, key=map_key), key=map_key)
+    }
 
 
 # %%
-def fix_ref(x: Ref) -> Ref:
-    x.file_name = fix_filename(x.file_name)
-    return x
+@dataclass
+class Sentence:
+    ref_id: int  # unique id for refering expression
+    sent: str
 
 
-def fix_filename(x: str) -> str:
-    """
-    :param x: COCO_..._[image_id]_[annotation_id].jpg
-    :return:  COCO_..._[image_id].jpg
+with open(path_sentences, "r") as f:
+    raw = csv.DictReader(f)
+    sentences: list[Sentence] = [Sentence(**row) for row in raw]
 
-    >>> fix_filename('COCO_..._[image_id]_0000000001.jpg')
-    'COCO_..._[image_id].jpg'
 
-    """
-    return re.sub("_\d+\.jpg$", ".jpg", x)
-
+id2sents: dict[int, list[str]] = groupby(
+    sentences, lambda x: x.ref_id, lambda x: x.sent
+)
 
 # %%
-with open(data_refs, "rb") as f:
-    raw = pickle.load(f)
-
-refs: list[Ref] = [fix_ref(Ref(**ref)) for ref in raw]
-
-# %%
-with open(data_instances, "r") as f:
-    raw = json.load(f)
-
-instances: Instances = Instances(**raw)
-
-id2annotation: Mapping[int, Annotation] = {x.id: x for x in instances.annotations}
+TensorImage = UInt[torch.Tensor, "3 H W"]
 
 
-# %%
-class CocoDataset(Dataset[tuple[PIL.Image, list[str], Float[torch.Tensor, "4"]]]):
+class Coco4ClipDataset(Dataset[tuple[TensorImage, list[str]]]):
     def __init__(
         self,
         split: Split,
         limit: int = -1,
     ):
-        self.__init__
-        self.items: list[tuple[str, list[str], Float[torch.Tensor, "4"]]] = [
-            (i, [s.sent for s in ss], xywh)
+        self.items: list[tuple[str, list[str], Float[torch.Tensor, "1 4"]]] = [
+            (img, sents, xyxy)
             for ref in refs
             if ref.split == split
-            for i in [os.path.join(data_images, ref.file_name)]
-            for ss in [ref.sentences]
-            for xywh in [
-                torch.tensor(id2annotation[ref.ann_id].bbox, dtype=torch.float)
-            ]
+            for img in [os.path.join(path_images, ref.file_name)]
+            for sents in [id2sents[ref.ref_id]]
+            for xyxy in [torch.tensor([(ref.xmin, ref.ymin, ref.xmax, ref.ymax)])]
         ]
         self.len: int = len(self.items) if limit < 0 else min(limit, len(self.items))
 
     def __len__(self) -> int:
         return self.len
 
-    def __getitem__(
-        self, index: int
-    ) -> tuple[PIL.Image, list[str], Float[torch.Tensor, "4"]]:
-        i, ps, xywh = self.items[index]
-        xyxy: Float[torch.Tensor, "4"] = torchvision.ops.box_convert(
-            xywh, in_fmt="xywh", out_fmt="xyxy"
+    def __getitem__(self, index: int) -> tuple[TensorImage, list[str]]:
+        file_name, sents, xyxy = self.items[index]
+        img: TensorImage = read_image(file_name, ImageReadMode.RGB).to(device)
+
+        xywh: Int[torch.Tensor, "1 4"] = (
+            box_convert(xyxy, in_fmt="xyxy", out_fmt="xywh").round().int()
         )
-        with PIL.Image.open(i) as img:
-            img.load()
-            return img, ps, xyxy
+        [[x, y, w, h]] = xywh.tolist()
 
-
-# %%
-def unzip(batch: list[tuple[T, ...]]) -> tuple[list[T], ...]:
-    return tuple(zip(*batch))
-
-
-# %%
-batch_size: int = 3
-limit: int = 5 * batch_size
-
-# %%
-dl: DataLoader[
-    tuple[list[PIL.Image], list[list[str]], list[Float[torch.Tensor, "4"]]]
-] = DataLoader(
-    dataset=CocoDataset(split="test", limit=limit),
-    batch_size=batch_size,
-    collate_fn=unzip,
-)
-
-# %%
-imgs: tuple[PIL.Image, ...]
-promptss: tuple[list[str], ...]
-true_xyxy: tuple[Float[torch.Tensor, "4"], ...]
-
-for imgs, promptss, true_xyxy in dl:
-    print(imgs)
-    print(promptss)
-    print(true_xyxy)
-    print("-" * 50)
+        return crop(img, top=y, left=x, height=h, width=w), sents
 
 
 # %% [markdown]
 # # Image augmentation
 
 # %%
-class RandomChoice(torch.nn.Module):
-    def __init__(self, transforms):
-        super().__init__()
-        self.transforms = transforms
-
-    def __call__(self, imgs):
-        return [random.choice(self.transforms)(img) for img in imgs]
-
-
-# %%
-transform = RandomChoice(
+transform: RandomChoice = RandomChoice(
     [
-        transforms.ColorJitter(
+        ColorJitter(
             brightness=0.5, hue=0.3
         ),  # randomly changes the brightness, saturation, and other properties of an image
-        transforms.GaussianBlur(
+        GaussianBlur(
             kernel_size=(5, 9), sigma=(0.1, 5)
         ),  # performs gaussian blur transform on an image
-        transforms.RandomInvert(),  # randomly inverts the colors of the given image
-        transforms.RandomPosterize(
+        RandomInvert(),  # randomly inverts the colors of the given image
+        RandomPosterize(
             bits=2
         ),  # randomly posterizes the image by reducing the number of bits of each color channel
-        transforms.RandomSolarize(
+        RandomSolarize(
             threshold=192.0
         ),  # randomly solarizes the image by inverting all pixel values above the threshold
-        transforms.RandomAdjustSharpness(
+        RandomAdjustSharpness(
             sharpness_factor=2
         ),  # randomly adjusts the sharpness of the given image
-        transforms.RandomAutocontrast(),  # randomly applies autocontrast to the given image
-        transforms.RandomEqualize(),  # randomly equalizes the histogram of the given image
-        transforms.Grayscale(num_output_channels=3),  # converts an image to grayscale
+        RandomAutocontrast(),  # randomly applies autocontrast to the given image
+        RandomEqualize(),  # randomly equalizes the histogram of the given image
+        Grayscale(num_output_channels=3),  # converts an image to grayscale
     ]
 )
 
 # %%
-torch.manual_seed(42)
+for _, (c, prompt) in zip(range(5), Coco4ClipDataset("test")):
+    f: plt.Figure
+    axs: tuple[plt.Axes, plt.Axes]
+    f, axs = plt.subplots(1, 2, figsize=(2 * 3, 1 * 3))
 
-
-def display_images(images, titles, rows, cols):
-    fig, axes = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3))
-    for i, ax in enumerate(axes.flatten()):
-        ax.imshow(images[i])
-        ax.set_title(titles[i] + str(images[i].size))
+    f.suptitle(prompt)
+    for ax, img in zip(axs, [c, transform(c)]):
+        ax.imshow(img.permute(1, 2, 0).cpu())
         ax.axis("off")
-    plt.tight_layout()
+
+    f.tight_layout()
     plt.show()
-
-
-for imgs, promptss, true_xyxy in dl:
-    transformed_images = transform(imgs)
-
-    display_images(
-        images=list(imgs) + transformed_images,
-        titles=[
-            "Original Image 1",
-            "Original Image 2",
-            "Original Image 3",
-            "Transformed Image 1",
-            "Transformed Image 2",
-            "Transformed Image 3",
-        ],
-        rows=2,
-        cols=3,
-    )
 
 # %% [markdown]
 # # Text augmentation
-
-# %%
-# !pip install transformers
-# !pip install sentencepiece
 
 # %%
 # EDA
 # paper: https://aclanthology.org/D19-1670.pdf
 # paper: https://arxiv.org/abs/1907.03752
 # code reference: https://github.com/dsfsi/textaugment
-try:
-    from textaugment import EDA
-except ModuleNotFoundError:
-    # !pip install textaugment
-    from textaugment import EDA
+from textaugment import EDA
 
 import nltk  # NLTK is a leading platform for building Python programs to work with human language data
 
@@ -362,32 +255,15 @@ nltk.download("wordnet")
 from transformers import PegasusForConditionalGeneration, PegasusTokenizer
 
 pegasus_model_name = "tuner007/pegasus_paraphrase"
-pegasus_torch_device = device
 pegasus_tokenizer = PegasusTokenizer.from_pretrained(pegasus_model_name)
 pegasus_model = PegasusForConditionalGeneration.from_pretrained(pegasus_model_name).to(
-    pegasus_torch_device
+    device
 )
 
+pegasus_model.eval()
 
-# %%
-def pegasus_get_response(input_text, num_return_sequences=1, num_beams=10):
-    batch = pegasus_tokenizer(
-        [input_text],
-        truncation=True,
-        padding="longest",
-        max_length=60,
-        return_tensors="pt",
-    ).to(pegasus_torch_device)
-    translated = pegasus_model.generate(
-        **batch,
-        max_length=60,
-        num_beams=num_beams,
-        num_return_sequences=num_return_sequences,
-        temperature=1.5
-    )
-    tgt_text = pegasus_tokenizer.batch_decode(translated, skip_special_tokens=True)
-    return tgt_text
-
+for p in pegasus_model.parameters():
+    p.requires_grad = False
 
 # %%
 # A large BART seq2seq (text2text generation) model fine-tuned on 3 paraphrase datasets.
@@ -395,108 +271,66 @@ def pegasus_get_response(input_text, num_return_sequences=1, num_beams=10):
 # code reference: https://huggingface.co/eugenesiow/bart-paraphrase
 from transformers import BartForConditionalGeneration, BartTokenizer
 
-bart_model = BartForConditionalGeneration.from_pretrained("eugenesiow/bart-paraphrase")
-bart_torch_device = device
-bart_model = bart_model.to(bart_torch_device)
-bart_tokenizer = BartTokenizer.from_pretrained("eugenesiow/bart-paraphrase")
+bart_model_name = "eugenesiow/bart-paraphrase"
+bart_tokenizer = BartTokenizer.from_pretrained(bart_model_name)
+bart_model = BartForConditionalGeneration.from_pretrained(bart_model_name).to(device)
+
+bart_model.eval()
+
+for p in bart_model.parameters():
+    p.requires_grad = False
 
 
 # %%
-class TextAugmentation(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.eda_transformation = EDA(random_state=1)  # EDA initialization
-
-        self.transforms = [
-            self.eda_synonym_replacement,
-            self.template_insertion("A photo of {}"),
-            self.template_insertion("A picture of {}"),
-            self.template_insertion("An image of {}"),
-            self.template_insertion("This is {}"),
-            self.template_insertion("We can see {}"),
-            self.pegasus_augmentation,
-            self.bert_augmentation,
-        ]
-
-    # randomly choose n words from the sentence that are not stop words. Replace each of these words with one of its synonyms chosen at random
-    def eda_synonym_replacement(self, txt):
-        return self.eda_transformation.synonym_replacement(txt)
-
-    # add a template as suggested by the CLIP paper. Examples: A photo of {}, We can see {}, ...
-    def template_insertion(self, template):
-        return template.format
-
-    # pegasus paraphrasing
-    def pegasus_augmentation(self, txt):
-        return pegasus_get_response(txt)[0]
-
-    # bert paraphrasing
-    def bert_augmentation(self, txt):
-        batch = bart_tokenizer(txt, return_tensors="pt")
-        generated_ids = bart_model.generate(batch["input_ids"])
-        generated_sentence = bart_tokenizer.batch_decode(
-            generated_ids, skip_special_tokens=True
+def pegasus(txt: str) -> str:
+    with torch.inference_mode():
+        batch: dict[str, Int[torch.Tensor, "1 P"]] = pegasus_tokenizer(
+            [txt],
+            truncation=True,
+            padding="longest",
+            max_length=60,
+            return_tensors="pt",
         )
-        return generated_sentence[0]
+        translated: Int[torch.Tensor, "1 X"] = pegasus_model.generate(
+            **batch,
+            max_length=60,
+            num_beams=10,
+            num_return_sequences=1,
+            temperature=1.5
+        )
+        [out] = pegasus_tokenizer.batch_decode(translated, skip_special_tokens=True)
+        return out
 
-    def __call__(self, txts):
-        return [random.choice(self.transforms)(txt) for txt in txts]
+
+# %%
+def bart(txt: str) -> str:
+    with torch.inference_mode():
+        batch: dict[str, Int[torch.Tensor, "1 P"]] = bart_tokenizer(
+            txt, return_tensors="pt"
+        )
+        translated: Int[torch.Tensor, "1 X"] = bart_model.generate(batch["input_ids"])
+        [out] = bart_tokenizer.batch_decode(translated, skip_special_tokens=True)
+        return out
 
 
 # %%
-torch.manual_seed(42)
-text_transform = TextAugmentation()
-for imgs, promptss, true_xyxy in dl:
-    print("ORIGINAL PROMPTS")
-    for prompts in promptss:
-        for prompt in prompts:
-            print(prompt)
-
-    print("====\n")
-
-    print("TRANSFORMED")
-    for prompts in promptss:
-        transformed_prompts = text_transform(prompts)
-        for prompt in transformed_prompts:
-            print(prompt)
-
-    print("\nEND BATCH\n")
-
-# %% [markdown]
-# ### ChatGPT experiments
+eda: EDA = EDA(random_state=42)
 
 # %%
-"""
-!pip install openai
-import openai
-
-# Set your OpenAI API key here
-#openai.api_key = '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'
-openai.api_key = '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'
-
-# Define a prompt to start the conversation
-prompt = "You are a helpful assistant.\nUser: Hi, can you tell me about the solar system?"
-
-"""
-"""
-# Generate a response from ChatGPT
-response = openai.Completion.create(
-    engine="gpt-3.5-turbo",  # Use the appropriate engine for ChatGPT
-    prompt=prompt,
-    max_tokens=50  # You can adjust this to control the response length
+txt_transform: RandomChoice = RandomChoice(
+    [
+        "A photo of {}".format,
+        "A picture of {}".format,
+        "An image of {}".format,
+        "This is {}".format,
+        "We can see {}".format,
+        eda.synonym_replacement,
+        pegasus,
+        bart,
+    ]
 )
-"""
-"""
-response = openai.ChatCompletion.create(
- model="gpt-3.5-turbo",
- messages=[
- {"role": "user", "content": "Hello ChatGPT, does this work?"}
- ]
-)
-print(response.choices[0].message.content)
-"""
-"""
-# Extract and print the assistant's reply
-assistant_reply = response.choices[0].text.strip()
-print("Assistant:", assistant_reply)
-"""
+
+# %%
+for _, (c, prompts) in zip(range(5), Coco4ClipDataset("test")):
+    for prompt in prompts:
+        print(prompt, f"\n~> {txt_transform(prompt)}")
