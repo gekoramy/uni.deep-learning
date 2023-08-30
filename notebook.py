@@ -689,7 +689,6 @@ txt_transform: RandomChoice = RandomChoice([
 img_transform: RandomChoice = RandomChoice([
     ColorJitter(brightness=0.5, hue=0.3),              # randomly changes the brightness, saturation, and other properties of an image
     GaussianBlur(kernel_size=(5, 9), sigma=(0.1, 5)),  # performs gaussian blur transform on an image
-    RandomInvert(),                                    # randomly inverts the colors of the given image REMOVE
     RandomPosterize(bits=2),                           # randomly posterizes the image by reducing the number of bits of each color channel
     RandomSolarize(threshold=192.0),                   # randomly solarizes the image by inverting all pixel values above the threshold
     RandomAdjustSharpness(sharpness_factor=2),         # randomly adjusts the sharpness of the given image
