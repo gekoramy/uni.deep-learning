@@ -232,7 +232,9 @@ class CocoDataset(
                 torch.tensor([
                     (bbox.xmin, bbox.ymin, bbox.xmax, bbox.ymax)
                     for bbox in bboxes
-                    if bbox.confidence > 0.25  # ensure at least .25 confidence
+                    if bbox.confidence > .25  # lower bound on confidence
+                    if bbox.xmax - bbox.xmin > 16  # lower bound on width
+                    if bbox.ymax - bbox.ymin > 16  # lower bound on heigth
                 ])
             ]
             for xyxy in [
@@ -286,14 +288,16 @@ class CocoTrainDataset(
             for img in [os.path.join(path_images, ref.file_name)]
             for sents in [id2sents[ref.ref_id]]
             for bboxes in [img2bboxes[ref.file_name]]
-            if len(bboxes) > 1  # ensure at least 2 bboxes per image
             for xyxys in [
                 torch.tensor([
                     (bbox.xmin, bbox.ymin, bbox.xmax, bbox.ymax)
                     for bbox in bboxes
-                    if bbox.confidence > .25  # ensure at least .25 confidence
+                    if bbox.confidence > .25  # lower bound on confidence
+                    if bbox.xmax - bbox.xmin > 16  # lower bound on width
+                    if bbox.ymax - bbox.ymin > 16  # lower bound on heigth
                 ])
             ]
+            if xyxys.shape[0] > 1 # lower bound on bbox per image
             for xyxy in [
                 torch.tensor([(ref.xmin, ref.ymin, ref.xmax, ref.ymax)])
             ]
@@ -321,7 +325,7 @@ class CocoTrainDataset(
         xywhs: Int[torch.Tensor, "X 4"] = box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").round().int()
 
         crops: list[TensorImage] = [
-            crop(img, top=x, left=y, height=h, width=w)
+            crop(img, top=y, left=x, height=h, width=w)
             for xywh in xywhs
             for [x, y, w, h] in [xywh.tolist()]
         ]
@@ -347,6 +351,22 @@ for p in clip_model.parameters():
 
 
 # %%
+def transform(n_px: int):
+    """
+    https://github.com/openai/CLIP/blob/a1d071733d7111c9c014f024669f959182114e33/clip/clip.py#L75-L86
+    """
+    return Compose([
+        ConvertImageDtype(torch.float),
+        Resize(n_px, interpolation=InterpolationMode.BICUBIC, antialias=True),
+        CenterCrop(n_px),
+        Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
+    ])
+
+
+preprocess: Compose = transform(224)
+
+
+# %%
 class CLIP_freezed_img_encoder(nn.Module):
     def forward(
         self, image: Float[torch.Tensor, "crops 3 244 244"]
@@ -369,55 +389,15 @@ clip_freezed_txt_encoder: CLIP_freezed_txt_encoder = CLIP_freezed_txt_encoder()
 
 
 # %%
-class CLIP_SF_img_encoder(nn.Sequential):
-    def __init__(self):
-        super().__init__(
-            clip_freezed_img_encoder,
-            nn.Linear(1024, 1024),
-            nn.ReLU(),
-            nn.Linear(1024, 1024),
-        )
-
-
-class CLIP_SF_txt_encoder(nn.Sequential):
-    def __init__(self):
-        super().__init__(
-            clip_freezed_txt_encoder,
-            nn.Linear(1024, 1024),
-            nn.ReLU(),
-            nn.Linear(1024, 1024),
-        )
-
-
-# %%
-summary(
-    CLIP_SF_img_encoder().to(device),
-    input_size=(1, 3, 224, 224),
-    dtypes=[torch.float],
-    device=device,
-    col_names=["input_size", "output_size", "num_params", "trainable"],
-)
-
-# %%
-summary(
-    CLIP_SF_txt_encoder().to(device),
-    input_size=(1, 77),
-    dtypes=[torch.int],
-    col_names=["input_size", "output_size", "num_params", "trainable"],
-    device=device,
-)
-
-
-# %%
-class CLIP_SF_CORE(nn.Module):
+class ClipSfCore(nn.Module):
     def __init__(
         self,
-        visual_encoder: nn.Module,  # visual encoder
-        text_encoder: nn.Module,  # natural language prompts encoder
+        img_encoder: nn.Module,  # visual encoder
+        txt_encoder: nn.Module,  # natural language prompts encoder
     ):
         super().__init__()
-        self.visual_encoder = visual_encoder
-        self.text_encoder = text_encoder
+        self.img_encoder = img_encoder
+        self.txt_encoder = txt_encoder
 
     def cosine_similarity(
         self,
@@ -437,10 +417,10 @@ class CLIP_SF_CORE(nn.Module):
         prompts: Int[torch.Tensor, "prompts 77"],
     ) -> Float[torch.Tensor, "crops 1"]:
         # step 1: compute crop representation in the latent space
-        crop_z: Float[torch.Tensor, "crops 1024"] = self.visual_encoder(crops)
+        crop_z: Float[torch.Tensor, "crops 1024"] = self.img_encoder(crops)
 
         # step 2: compute prompt representation in the latent space
-        prompt_z: Int[torch.Tensor, "prompts 1024"] = self.text_encoder(prompts)
+        prompt_z: Int[torch.Tensor, "prompts 1024"] = self.txt_encoder(prompts)
 
         # step 3: evaluate logits
         similarity_matrix: Float[torch.Tensor, "prompts crops"] = self.cosine_similarity(crop_z, prompt_z)
@@ -450,18 +430,16 @@ class CLIP_SF_CORE(nn.Module):
 
 
 # %%
-class CLIP_SF(nn.Module):
+class ClipSf(nn.Module):
     def __init__(
         self,
-        img_preprocess: t.Callable[[TensorImage], Float[torch.Tensor, "3 244 244"]],
-        txt_preprocess: t.Callable[[list[str]], Float[torch.Tensor, "prompts 77"]],
         img_encoder: nn.Module,  # visual encoder
         txt_encoder: nn.Module,  # natural language prompts encoder
     ):
         super().__init__()
-        self.img_preprocess = img_preprocess
-        self.txt_preprocess = txt_preprocess
-        self.core = CLIP_SF_CORE(img_encoder, txt_encoder)
+        self.img_preprocess: Compose = preprocess
+        self.txt_preprocess: t.Callable[[t.Union[str, list[str]]], Float[torch.Tensor, "77"]] = clip.tokenize
+        self.core = ClipSfCore(img_encoder, txt_encoder)
 
     def forward(self, crops: list[TensorImage], prompts: list[str]) -> Float[torch.Tensor, "crops 1"]:
         # step 1: preprocess crops as required by the visual encoder
@@ -481,9 +459,9 @@ class CLIP_SF(nn.Module):
 # %%
 with SummaryWriter() as writer:
     writer.add_graph(
-        model=CLIP_SF_CORE(
-            visual_encoder=CLIP_SF_img_encoder(),
-            text_encoder=CLIP_SF_txt_encoder(),
+        model=ClipSfCore(
+            img_encoder=clip_freezed_img_encoder,
+            txt_encoder=clip_freezed_txt_encoder,
         ),
         input_to_model=[
             torch.ones((5, 3, 244, 244)),
@@ -493,9 +471,9 @@ with SummaryWriter() as writer:
 
 # %%
 summary(
-    CLIP_SF_CORE(
-        visual_encoder=CLIP_SF_img_encoder(),
-        text_encoder=CLIP_SF_txt_encoder(),
+    ClipSfCore(
+        img_encoder=clip_freezed_img_encoder,
+        txt_encoder=clip_freezed_txt_encoder,
     ),
     input_size=[(5, 3, 244, 244), (2, 77)],
     dtypes=[torch.float, torch.int],
@@ -533,9 +511,6 @@ def best_bbox(pred: Float[torch.Tensor, "crops 4"], groundtruth: Float[torch.Ten
     """
     return torch.argmax(box_iou(pred, groundtruth)).item()
 
-
-# %%
-doctest.testmod()
 
 # %%
 loss_fn: t.Callable[[Float[torch.Tensor, "crops"], Int[torch.Tensor, "1"]], Float[torch.Tensor, "1"]] = nn.functional.cross_entropy
@@ -643,7 +618,7 @@ def test_step(
             xywhs: Int[torch.Tensor, "X 4"] = box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").round().int()
 
             crops: list[TensorImage] = [
-                crop(img, top=x, left=y, height=h, width=w)
+                crop(img, top=y, left=x, height=h, width=w)
                 for xywh in xywhs
                 for [x, y, w, h] in [xywh.tolist()]
             ]
@@ -695,14 +670,14 @@ def showtime(
 
         progress = tqdm(data_loader, desc=f"showtime")
 
-        for iter, (img, prompts, xyxys, true_xyxy) in enumerate(progress):
+        for iter, (img, prompts, xyxys, true_xyxy) in zip(it.count(1), progress):
             true_i: int = best_bbox(xyxys, true_xyxy)
 
             # from xyxys to crops
             xywhs: Int[torch.Tensor, "X 4"] = box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").round().int()
 
             crops: list[TensorImage] = [
-                crop(img, top=x, left=y, height=h, width=w)
+                crop(img, top=y, left=x, height=h, width=w)
                 for xywh in xywhs
                 for [x, y, w, h] in [xywh.tolist()]
             ]
@@ -718,7 +693,7 @@ def showtime(
 
             # https://github.com/pytorch/pytorch/issues/65449
             writer.add_image_with_boxes(
-                tag=f"{iter + 1}",
+                tag=f"{iter}: {' ¶ '.join(prompts)}",
                 img_tensor=img,
                 box_tensor=torch.stack((xyxys[pred_i], xyxys[true_i], true_xyxy.squeeze())),
                 labels=["prediction", "best region proposal", "ground truth"],
@@ -753,7 +728,7 @@ def eval_step(
             xywhs: Int[torch.Tensor, "X 4"] = box_convert(xyxys, in_fmt="xyxy", out_fmt="xywh").round().int()
 
             crops: list[TensorImage] = [
-                crop(img, top=x, left=y, height=h, width=w)
+                crop(img, top=y, left=x, height=h, width=w)
                 for xywh in xywhs
                 for [x, y, w, h] in [xywh.tolist()]
             ]
@@ -763,7 +738,7 @@ def eval_step(
 
             true_crop: TensorImage
             [true_crop] = [
-                crop(img, top=x, left=y, height=h, width=w)
+                crop(img, top=y, left=x, height=h, width=w)
                 for xywh in true_xywh
                 for [x, y, w, h] in [xywh.tolist()]
             ]
@@ -807,7 +782,7 @@ LIMIT: int = 10 * BATCH_SIZE
 NUM_WORKERS: int = 0  # os.cpu_count() or 1
 EPOCHS: int = 100
 
-#%%
+# %%
 train_loader: DataLoader[
     tuple[
         tuple[TensorImage, ...],
@@ -825,32 +800,22 @@ train_loader: DataLoader[
     shuffle=True,
 )
 
-bna_train_loader: DataLoader[
-    tuple[TensorImage, list[str], Float[torch.Tensor, "X 4"], Float[torch.Tensor, "4"]]
-] = DataLoader(
-    dataset=CocoDataset(split="train", img2bboxes=img2detr, limit=LIMIT),
-    batch_size=None,
-    num_workers=NUM_WORKERS,
-    shuffle=False,
-)
-
-val_loader: DataLoader[
-    tuple[TensorImage, list[str], Float[torch.Tensor, "X 4"], Float[torch.Tensor, "4"]]
-] = DataLoader(
-    dataset=CocoDataset(split="val", img2bboxes=img2detr, limit=LIMIT),
-    batch_size=None,
-    num_workers=NUM_WORKERS,
-    shuffle=False,
-)
-
-test_loader: DataLoader[
-    tuple[TensorImage, list[str], Float[torch.Tensor, "X 4"], Float[torch.Tensor, "4"]]
-] = DataLoader(
-    dataset=CocoDataset(split="test", img2bboxes=img2detr, limit=LIMIT),
-    batch_size=None,
-    num_workers=NUM_WORKERS,
-    shuffle=False,
-)
+split2loader: dict[
+    Split,
+    DataLoader[
+        tuple[
+            TensorImage, list[str], Float[torch.Tensor, "X 4"], Float[torch.Tensor, "4"]
+        ]
+    ],
+] = {
+    split: DataLoader(
+        dataset=CocoDataset(split=split, img2bboxes=img2detr, limit=LIMIT),
+        batch_size=None,
+        num_workers=NUM_WORKERS,
+        shuffle=False,
+    )
+    for split in ["train", "val", "test"]
+}
 
 showtime_loader: DataLoader[
     tuple[TensorImage, list[str], Float[torch.Tensor, "X 4"], Float[torch.Tensor, "4"]]
@@ -877,15 +842,15 @@ def training_loop(
         print("Before training:")
         bna_train_loss, bna_train_accuracy = test_step(
             model=model,
-            data_loader=bna_train_loader,
+            data_loader=split2loader["train"],
         )
         test_loss, test_accuracy = test_step(
             model=model,
-            data_loader=test_loader,
+            data_loader=split2loader["test"],
         )
         val_loss, val_accuracy = test_step(
             model=model,
-            data_loader=val_loader,
+            data_loader=split2loader["val"],
         )
 
         showtime(model=model, data_loader=showtime_loader, writer=writer, global_step=0)
@@ -927,7 +892,7 @@ def training_loop(
 
             val_loss, val_accuracy = test_step(
                 model=model,
-                data_loader=val_loader,
+                data_loader=split2loader["val"],
             )
 
             loss["train"].append(train_loss)
@@ -963,16 +928,18 @@ def training_loop(
                 refresh=False,
             )
 
+            torch.save(obj=model.state_dict(), f=f"{name}-{(epoch + 1):02d}.pth")
+
         # compute final evaluation results
         print("After training:")
 
         bna_train_loss, bna_train_accuracy = test_step(
             model=model,
-            data_loader=bna_train_loader,
+            data_loader=split2loader["train"],
         )
         test_loss, test_accuracy = test_step(
             model=model,
-            data_loader=test_loader,
+            data_loader=split2loader["test"],
         )
 
         showtime(
@@ -1024,36 +991,7 @@ def training_loop(
 
 
 # %%
-def transform(n_px: int):
-    """
-    https://github.com/openai/CLIP/blob/a1d071733d7111c9c014f024669f959182114e33/clip/clip.py#L75-L86
-    """
-    return Compose([
-        ConvertImageDtype(torch.float),
-        Resize(n_px, interpolation=InterpolationMode.BICUBIC, antialias=True),
-        CenterCrop(n_px),
-        Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
-    ])
-
-
-preprocess: Compose = transform(224)
-
-# %% [markdown]
-# ## Architettura 1
-# freeze immagine: false<br>
-# freeze testo: true<br>
-# layer interni immagine: 1024 -> 1024<br>
-# layer interni testo: 1024 -> 1024<br>
-# activation function immagine: ReLU<br>
-# activation function testo: ReLU<br>
-# optimizer: SGD(lr=0.01, weight_decay=0.000001, momentum=0.9)<br>
-# epoch: 10<br>
-# batch size: 16<br>
-
-# %%
-net1: CLIP_SF = CLIP_SF(
-    img_preprocess=preprocess,
-    txt_preprocess=clip.tokenize,
+net1: ClipSf = ClipSf(
     img_encoder=nn.Sequential(
         clip_freezed_img_encoder,
         nn.ReLU(),
@@ -1062,22 +1000,8 @@ net1: CLIP_SF = CLIP_SF(
     txt_encoder=clip_freezed_txt_encoder,
 )
 
-# %% [markdown]
-# ## Architettura 2
-# freeze immagine: false<br>
-# freeze testo: false<br>
-# layer interni immagine: 1024 -> 512 -> 256 -> 1024<br>
-# layer interni testo: 1024 -> 512 -> 256 -> 1024<br>
-# activation function immagine: ReLU<br>
-# activation function testo: ReLU<br>
-# optimizer: SGD(lr=0.01, weight_decay=0.000001, momentum=0.9)<br>
-# epoch: 10<br>
-# batch size: 16<br>
-
 # %%
-net2: CLIP_SF = CLIP_SF(
-    img_preprocess=preprocess,
-    txt_preprocess=clip.tokenize,
+net2: ClipSf = ClipSf(
     img_encoder=nn.Sequential(
         clip_freezed_img_encoder,
         nn.ReLU(),
@@ -1098,22 +1022,8 @@ net2: CLIP_SF = CLIP_SF(
     ),
 )
 
-# %% [markdown]
-# ## Architettura 3
-# freeze immagine: false<br>
-# freeze testo: false<br>
-# layer interni immagine: 1024 -> 512 -> 256 -> 1024<br>
-# layer interni testo: 1024 -> 512 -> 256 -> 1024<br>
-# activation function immagine: ReLU<br>
-# activation function testo: Sigmoid<br>
-# optimizer: Adagrad(come Nielsen lr=0.0015, weigth_decay=0.000001) eventualmente usare frase di nielsen e gif a questo sito come motivazione https://towardsdatascience.com/a-visual-explanation-of-gradient-descent-methods-momentum-adagrad-rmsprop-adam-f898b102325c<br>
-# epoch: 10<br>
-# batch size: 16<br>
-
 # %%
-net3: CLIP_SF = CLIP_SF(
-    img_preprocess=preprocess,
-    txt_preprocess=clip.tokenize,
+net3: ClipSf = ClipSf(
     img_encoder=nn.Sequential(
         clip_freezed_img_encoder,
         nn.ReLU(),
@@ -1134,22 +1044,8 @@ net3: CLIP_SF = CLIP_SF(
     ),
 )
 
-# %% [markdown]
-# ## Architettura 4
-# freeze immagine: false<br>
-# freeze testo: false<br>
-# layer interni immagine: 1024 -> 512<br>
-# layer interni testo: 1024 -> 512<br>
-# activation function immagine: ReLU<br>
-# activation function testo: ReLU<br>
-# optimizer: SGD(lr=0.01, weight_decay=0.000001, momentum=0.9)<br>
-# epoch: 10<br>
-# batch size: 16<br>
-
 # %%
-net4: CLIP_SF = CLIP_SF(
-    img_preprocess=preprocess,
-    txt_preprocess=clip.tokenize,
+net4: ClipSf = ClipSf(
     img_encoder=nn.Sequential(
         clip_freezed_img_encoder,
         nn.ReLU(),
@@ -1168,10 +1064,10 @@ net4: CLIP_SF = CLIP_SF(
 
 # %%
 models: dict[str, tuple[torch.nn.Module, t.Callable[[t.Iterable[torch.Tensor]], torch.optim.Optimizer]]] = {
-    "net1": (net1, lambda params: torch.optim.SGD(params=params, lr=1e-2, weight_decay=1e-6, momentum=.9)),
-    "net2": (net2, lambda params: torch.optim.SGD(params=params, lr=1e-2, weight_decay=1e-6, momentum=.9)),
-    "net3": (net3, lambda params: torch.optim.Adadelta(params=params, lr=15e-4, weight_decay=1e-6)),
-    "net4": (net4, lambda params: torch.optim.SGD(params=params, lr=1e-2, weight_decay=1e-6, momentum=.9)),
+    "net1": (net1, lambda params: torch.optim.SGD(params=params, lr=.01, weight_decay=.01, momentum=.9)),
+    "net2": (net2, lambda params: torch.optim.SGD(params=params, lr=.01, weight_decay=.01, momentum=.9)),
+    "net3": (net3, lambda params: torch.optim.Adadelta(params=params, lr=.0015, weight_decay=.01)),
+    "net4": (net4, lambda params: torch.optim.SGD(params=params, lr=.01, weight_decay=.01, momentum=.9)),
 }
 
 # %%
@@ -1207,7 +1103,7 @@ def compare(reports: dict[str, pd.DataFrame]) -> pd.DataFrame:
 
 # %%
 eval_reports: dict[str, pd.DataFrame] = {
-    name: eval_step(model, test_loader, preprocess) for name, (model, _) in models.items()
+    name: eval_step(model, split2loader["test"], preprocess) for name, (model, _) in models.items()
 }
 
 # %%
