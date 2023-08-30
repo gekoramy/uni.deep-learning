@@ -17,11 +17,14 @@ matplotlib
 pandas
 pydantic
 regex
+sentencepiece
 tensorboard
+textaugment
 torch
 torchinfo
 torchvision
 tqdm
+transformers
 END
 
 pip install -q -r requirements.txt
@@ -40,6 +43,7 @@ import itertools as it
 import math
 import os
 import typing as t
+import random
 
 import clip
 import pandas as pd
@@ -62,6 +66,16 @@ from torchvision.transforms import (
     Normalize,
     InterpolationMode,
     ConvertImageDtype,
+    ColorJitter,
+    GaussianBlur,
+    RandomChoice,
+    RandomInvert,
+    RandomPosterize,
+    RandomSolarize,
+    RandomAdjustSharpness,
+    RandomAutocontrast,
+    RandomEqualize,
+    Grayscale,
 )
 from torchvision.transforms.functional import crop
 from tqdm.auto import tqdm, trange
@@ -78,6 +92,7 @@ torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
 torch.use_deterministic_algorithms(False)  # CLIP uses non-deterministic algorithms
 g: torch.Generator = torch.Generator(device=device).manual_seed(42)
+random.seed(42)
 
 # %% [markdown]
 # #### Dataset and type declaration
@@ -429,6 +444,7 @@ loss_fn: t.Callable[
 def training_step(
     model: ClipFlyp,
     data_loader: DataLoader[tuple[TensorImage, list[str]]],
+    synonyms: int,
     optimizer: torch.optim.Optimizer,
 ) -> float:
     running_loss: float = 0.0
@@ -436,17 +452,28 @@ def training_step(
 
     model.train()
 
-    entries: tuple[tuple[TensorImage, list[str]], ...]
-    entry: tuple[TensorImage, list[str]]
+    entries: list[list[tuple[TensorImage, str]]]
+    entry: list[tuple[TensorImage, str]]
 
     for iter, entries in zip(it.count(1), progress):
+
         # forward computation
-        imgs_features, txts_features, logit_scale = model(
-            [(img, prompts[0]) for img, prompts in entries]
-        )
+        imgs_features: Float[torch.Tensor, "entries*synonyms 1024"]
+        txts_features: Float[torch.Tensor, "entries*synonyms 1024"]
+        logit_scale: Float[torch.Tensor, "1"]
+        imgs_features, txts_features, logit_scale = model(list(it.chain(*entries)))
+
+        imgs_features_3d: Float[torch.Tensor, "entries synonyms 1024"] = imgs_features.view(len(entries), synonyms, 1024)
+        imgs_features_3d: Float[torch.Tensor, "synonyms entries 1024"] = imgs_features_3d.transpose(0, 1)
+
+        txts_features_3d: Float[torch.Tensor, "entries synonyms 1024"] = txts_features.view(len(entries), synonyms, 1024)
+        txts_features_3d: Float[torch.Tensor, "synonyms entries 1024"] = txts_features_3d.transpose(0, 1)
 
         # calculate loss
-        loss: Float[torch.Tensor, "1"] = loss_fn(imgs_features, txts_features, logit_scale)
+        loss: Float[torch.Tensor, "1"] = torch.stack([
+            loss_fn(imgs_features_2d, txts_features_2d, logit_scale)
+            for imgs_features_2d, txts_features_2d in zip(imgs_features_3d, txts_features_3d)
+        ]).mean()
         running_loss += loss.item()
 
         # optimizer zero grad
@@ -568,23 +595,156 @@ def training_showtime(
                 writer.add_figure(tag=f"matrix {iter}/{split}", figure=f, global_step=global_step)
 
 
+# %% [markdown]
+# Data augmentation
+
 # %%
-BATCH_SIZE: int = 6
-LIMIT: int = 1 * BATCH_SIZE  # (5_000 // BATCH_SIZE) * BATCH_SIZE
+# EDA
+# paper: https://aclanthology.org/D19-1670.pdf
+# paper: https://arxiv.org/abs/1907.03752
+# code reference: https://github.com/dsfsi/textaugment
+from textaugment import EDA
+
+import nltk  # NLTK is a leading platform for building Python programs to work with human language data
+
+nltk.download("stopwords")
+nltk.download("wordnet")
+
+eda: EDA = EDA(random_state=42)
+
+# %%
+# A large BART seq2seq (text2text generation) model fine-tuned on 3 paraphrase datasets.
+# paper: https://arxiv.org/abs/1910.13461
+# code reference: https://huggingface.co/eugenesiow/bart-paraphrase
+from transformers import BartForConditionalGeneration, BartTokenizer
+
+bart_model_name: str = "eugenesiow/bart-paraphrase"
+bart_tokenizer: Compose = BartTokenizer.from_pretrained(bart_model_name)
+bart_model: nn.Module = BartForConditionalGeneration.from_pretrained(bart_model_name).to(device)
+
+bart_model.eval()
+
+for p in bart_model.parameters():
+    p.requires_grad = False
+
+# %%
+# PEGASUS fine-tuned for paraphrasing
+# paper: https://arxiv.org/abs/1912.08777
+# code reference: https://huggingface.co/tuner007/pegasus_paraphrase
+from transformers import PegasusForConditionalGeneration, PegasusTokenizer
+
+pegasus_model_name: str = "tuner007/pegasus_paraphrase"
+pegasus_tokenizer: Compose = PegasusTokenizer.from_pretrained(pegasus_model_name)
+pegasus_model: nn.Module = PegasusForConditionalGeneration.from_pretrained(pegasus_model_name).to(device)
+
+pegasus_model.eval()
+
+for p in pegasus_model.parameters():
+    p.requires_grad = False
+
+
+# %%
+def pegasus(txt: str) -> str:
+    with torch.inference_mode():
+        batch: dict[str, Int[torch.Tensor, "1 P"]] = pegasus_tokenizer(
+            [txt],
+            truncation=True,
+            padding="longest",
+            max_length=60,
+            return_tensors="pt",
+        )
+        translated: Int[torch.Tensor, "1 X"] = pegasus_model.generate(
+            **batch,
+            max_length=60,
+            num_beams=10,
+            num_return_sequences=1,
+            temperature=1.5
+        )
+        [out] = pegasus_tokenizer.batch_decode(translated, skip_special_tokens=True)
+        return out
+
+
+def bart(txt: str) -> str:
+    with torch.inference_mode():
+        batch: dict[str, Int[torch.Tensor, "1 P"]] = bart_tokenizer(txt, return_tensors="pt")
+        translated: Int[torch.Tensor, "1 X"] = bart_model.generate(batch["input_ids"])
+        [out] = bart_tokenizer.batch_decode(translated, skip_special_tokens=True)
+        return out
+
+
+
+# %%
+txt_transform: RandomChoice = RandomChoice([
+    "A photo of {}".format,
+    "A picture of {}".format,
+    "An image of {}".format,
+    "This is {}".format,
+    "We can see {}".format,
+    eda.synonym_replacement,
+    pegasus,
+    bart,
+])
+
+# %%
+img_transform: RandomChoice = RandomChoice([
+    ColorJitter(brightness=0.5, hue=0.3),              # randomly changes the brightness, saturation, and other properties of an image
+    GaussianBlur(kernel_size=(5, 9), sigma=(0.1, 5)),  # performs gaussian blur transform on an image
+    RandomInvert(),                                    # randomly inverts the colors of the given image REMOVE
+    RandomPosterize(bits=2),                           # randomly posterizes the image by reducing the number of bits of each color channel
+    RandomSolarize(threshold=192.0),                   # randomly solarizes the image by inverting all pixel values above the threshold
+    RandomAdjustSharpness(sharpness_factor=2),         # randomly adjusts the sharpness of the given image
+    RandomAutocontrast(),                              # randomly applies autocontrast to the given image
+    RandomEqualize(),                                  # randomly equalizes the histogram of the given image
+    Grayscale(num_output_channels=3),                  # converts an image to grayscale
+])
+
+# %%
+BATCH_SIZE: int = 256
+SYNONYMS: int = 4
+LIMIT: int = 2 * BATCH_SIZE  # (5_000 // BATCH_SIZE) * BATCH_SIZE
 NUM_WORKERS: int = 0  # os.cpu_count() or 1
 EPOCHS: int = 50
 
+
+# %%
+def augment(batch: list[tuple[TensorImage, list[str]]]) -> list[list[tuple[TensorImage, str]]]:
+    return [
+        list(zip(
+            random.sample(
+                [img] +
+                [img_transform(img) for _ in range(SYNONYMS - 1)],
+                SYNONYMS
+            ),
+            random.sample(
+                prompts +
+                [txt_transform(random.choice(prompts)) for _ in range(SYNONYMS - len(prompts))],
+                SYNONYMS
+            )
+        ))
+        for img, prompts in batch
+    ]
+
+
+
 # %%
 split2loader: dict[Split, DataLoader[tuple[TensorImage, list[str]]]] = {
-    split: DataLoader(
-        dataset=Coco4ClipDataset(split=split, limit=LIMIT),
+    "train": DataLoader(
+        dataset=Coco4ClipDataset(split="train", limit=LIMIT),
         generator=g,
         batch_size=BATCH_SIZE,
         num_workers=NUM_WORKERS,
-        collate_fn=lambda x: x,
-        shuffle=(split == "train"),
-    )
-    for split in ["train", "val", "test"]
+        collate_fn=augment,
+        shuffle=True,
+    ),
+    **{
+        split: DataLoader(
+            dataset=Coco4ClipDataset(split=split, limit=LIMIT),
+            batch_size=BATCH_SIZE,
+            num_workers=NUM_WORKERS,
+            collate_fn=lambda x: x,
+        )
+        for split in ["val", "test"]
+    }
 }
 
 split2showtime_dataloader: dict[Split, DataLoader[tuple[TensorImage, list[str]]]] = {
@@ -646,6 +806,7 @@ def training_loop(
                 model=model,
                 data_loader=split2loader["train"],
                 optimizer=optimizer(model.parameters()),
+                synonyms=SYNONYMS
             )
 
             val_loss = test_step(
