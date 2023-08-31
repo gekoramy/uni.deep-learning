@@ -19,6 +19,7 @@ from pydantic.dataclasses import dataclass
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 from torchinfo import summary
+from torchinfo.model_statistics import ModelStatistics
 from torchvision.io import read_image, ImageReadMode
 from torchvision.ops import box_iou, box_convert
 from torchvision.transforms import (
@@ -155,8 +156,8 @@ def best_bbox(
 
 
 # %%
-def eval_summary(model: nn.Module):
-    summary(
+def eval_summary(model: nn.Module) -> ModelStatistics:
+    return summary(
         model,
         input_size=[(5, 3, 244, 244), (2, 77)],
         dtypes=[torch.float, torch.int],
@@ -165,8 +166,8 @@ def eval_summary(model: nn.Module):
 
 
 # %%
-def contrastive_summary(model: nn.Module):
-    summary(
+def contrastive_summary(model: nn.Module) -> ModelStatistics:
+    return summary(
         model,
         input_size=[(8, 3, 244, 244), (8, 77)],
         dtypes=[torch.float, torch.int],
@@ -723,6 +724,8 @@ class ClipSf(nn.Module):
 
 
 # %%
+_ = lambda params: torch.optim.SGD(params=params, lr=.01, weight_decay=.01, momentum=.9)
+
 eval_summary(
     ClipSf(
         img_encoder=nn.Sequential(
@@ -734,9 +737,9 @@ eval_summary(
     ).to(device).core
 )
 
+# %%
 _ = lambda params: torch.optim.SGD(params=params, lr=.01, weight_decay=.01, momentum=.9)
 
-# %%
 eval_summary(
     ClipSf(
         img_encoder=nn.Sequential(
@@ -760,35 +763,35 @@ eval_summary(
     ).to(device).core
 )
 
-_ = lambda params: torch.optim.SGD(params=params, lr=.01, weight_decay=.01, momentum=.9)
-
 # %%
-eval_summary(
-    ClipSf(
-        img_encoder=nn.Sequential(
-            clip_frozen_img_encoder,
-            nn.ReLU(),
-            nn.Linear(1024, 512),
-            nn.ReLU(),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1024),
-        ),
-        txt_encoder=nn.Sequential(
-            clip_frozen_txt_encoder,
-            nn.Sigmoid(),
-            nn.Linear(1024, 512),
-            nn.Sigmoid(),
-            nn.Linear(512, 256),
-            nn.Sigmoid(),
-            nn.Linear(256, 1024),
-        ),
-    ).to(device).core
-)
-
 _ = lambda params: torch.optim.Adadelta(params=params, lr=.0015, weight_decay=.01)
 
+eval_summary(
+    ClipSf(
+        img_encoder=nn.Sequential(
+            clip_frozen_img_encoder,
+            nn.ReLU(),
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1024),
+        ),
+        txt_encoder=nn.Sequential(
+            clip_frozen_txt_encoder,
+            nn.Sigmoid(),
+            nn.Linear(1024, 512),
+            nn.Sigmoid(),
+            nn.Linear(512, 256),
+            nn.Sigmoid(),
+            nn.Linear(256, 1024),
+        ),
+    ).to(device).core
+)
+
 # %%
+_ = lambda params: torch.optim.SGD(params=params, lr=.01, weight_decay=.01, momentum=.9)
+
 eval_summary(
     ClipSf(
         img_encoder=nn.Sequential(
@@ -803,8 +806,6 @@ eval_summary(
         ),
     ).to(device).core
 )
-
-_ = lambda params: torch.optim.SGD(params=params, lr=.01, weight_decay=.01, momentum=.9)
 
 # %%
 loss_fn: t.Callable[[Float[torch.Tensor, "crops"], Int[torch.Tensor, "1"]], Float[torch.Tensor, "1"]] = nn.functional.cross_entropy
@@ -1033,12 +1034,12 @@ class ClipFlyp(nn.Module):
         return self.core(crops_preprocessed, prompts_preprocessed)
 
 # %%
+_ = lambda params: torch.optim.SGD(params=params, lr=.01, weight_decay=.01, momentum=.9)
+_ = lambda params: torch.optim.Adam(params=params, lr=.00043, weight_decay=.01)
+
 contrastive_summary(
     ClipFlyp().to(device).core
 )
-
-_ = lambda params: torch.optim.SGD(params=params, lr=.01, weight_decay=.01, momentum=.9)
-_ = lambda params: torch.optim.Adam(params=params, lr=.00043, weight_decay=.01)
 
 # %%
 class ClipFlypEvalCore(nn.Module):
