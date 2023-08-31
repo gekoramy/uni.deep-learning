@@ -651,6 +651,20 @@ eval_summary(
     clip_model
 )
 
+# %%
+splits: list[Split] = ["train", "val", "test"]
+
+pd.concat(
+    [
+        pd.read_csv(f"assets/baseline/eval-baseline-{split}.csv", index_col=0)
+        for split in splits
+    ],
+    axis=1,
+    keys=splits,
+)
+
+# %%
+pd.read_csv(f"assets/baseline/comparing.csv", index_col=0)
 
 # %% [markdown]
 # ### standard fine tuning
