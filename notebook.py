@@ -8,6 +8,7 @@ import typing as t
 
 import clip
 import matplotlib.pyplot as plt
+import optuna
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -41,6 +42,8 @@ from torchvision.transforms import (
 )
 from torchvision.transforms.functional import crop
 from tqdm.auto import tqdm, trange
+from optuna.trial import Trial
+from optuna.study import Study
 
 # %%
 device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1788,3 +1791,84 @@ eval_summary(
         txt_encoder=clip_frozen_txt_encoder,
     ).to(device).core
 )
+
+# %%
+OPTUNA_BATCH_SIZE: int = 1024
+OPTUNA_LIMIT: int = 30 * OPTUNA_BATCH_SIZE
+OPTUNA_EPOCHS: int = 10
+
+# %%
+optuna_split2loader: dict[Split, DataLoader[tuple[TensorImage, list[str]]]] = {
+    split: DataLoader(
+        dataset=Coco4ContrastiveDataset(split=split, limit=OPTUNA_LIMIT),
+        generator=g,
+        batch_size=OPTUNA_BATCH_SIZE,
+        collate_fn=lambda x: x,
+        shuffle=(split == "train"),
+    )
+    for split in ["train", "val"]
+}
+
+
+# %%
+def objective(trial: Trial):
+
+    lr: float = trial.suggest_float("learning rate", 1e-5, .1, log=True)
+    p: float = trial.suggest_float("dropout", .1, .9)
+    optim: t.Literal["Adam", "SGD"] = trial.suggest_categorical("optimizer", ["Adam", "SGD"])
+
+    optuna_model: ClipFlyp = ClipFlyp(p=p).to(device)
+
+    match optim:
+      case "Adam":
+            optimizer: torch.optim.Optimizer = torch.optim.Adam(
+                params=optuna_model.parameters(),
+                lr=lr,
+                weight_decay=.01
+            )
+
+      case "SGD":
+            optimizer: torch.optim.Optimizer = torch.optim.SGD(
+                params=optuna_model.parameters(),
+                lr=lr,
+                weight_decay=.01,
+                momentum=.9
+            )
+
+    for epoch in trange(OPTUNA_EPOCHS):
+
+        training_step(
+            model = optuna_model,
+            data_loader = optuna_split2loader["train"],
+            optimizer = optimizer,
+        )
+
+        val_loss = test_step(
+            model = optuna_model,
+            data_loader = optuna_split2loader["val"],
+        )
+
+        trial.report(val_loss, epoch)
+
+        # Handle pruning based on the intermediate value.
+        if trial.should_prune():
+            raise optuna.TrialPruned()
+
+    return val_loss
+
+
+# %%
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+study: optuna.study.Study = optuna.create_study(
+    study_name="optuna-hyperparameter-optimization",
+    direction="minimize",
+    pruner=optuna.pruners.HyperbandPruner(),
+    load_if_exists=False,
+)
+
+# study.optimize(
+#     func=objective,
+#     timeout=5 * 60 * 60,
+#     show_progress_bar=True,
+# )
