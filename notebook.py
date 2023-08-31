@@ -1406,7 +1406,88 @@ pd.read_csv("assets/comparing[val].csv", index_col=0)
 pd.read_csv("assets/comparing[test].csv", index_col=0)
 
 # %% [markdown]
-# Data augmentation
+# ### Data augmentation
+
+# %% [markdown]
+# #### Text augmentation
+
+# %%
+# EDA
+# paper: https://aclanthology.org/D19-1670.pdf
+# paper: https://arxiv.org/abs/1907.03752
+# code reference: https://github.com/dsfsi/textaugment
+from textaugment import EDA
+
+import nltk  # NLTK is a leading platform for building Python programs to work with human language data
+
+nltk.download("stopwords")
+nltk.download("wordnet")
+
+
+# %%
+# PEGASUS fine-tuned for paraphrasing
+# paper: https://arxiv.org/abs/1912.08777
+# code reference: https://huggingface.co/tuner007/pegasus_paraphrase
+from transformers import PegasusForConditionalGeneration, PegasusTokenizer
+
+pegasus_model_name = "tuner007/pegasus_paraphrase"
+pegasus_tokenizer = PegasusTokenizer.from_pretrained(pegasus_model_name)
+pegasus_model = PegasusForConditionalGeneration.from_pretrained(pegasus_model_name).to(device)
+
+pegasus_model.eval()
+
+for p in pegasus_model.parameters():
+    p.requires_grad = False
+
+
+# %%
+# A large BART seq2seq (text2text generation) model fine-tuned on 3 paraphrase datasets.
+# paper: https://arxiv.org/abs/1910.13461
+# code reference: https://huggingface.co/eugenesiow/bart-paraphrase
+from transformers import BartForConditionalGeneration, BartTokenizer
+
+bart_model_name = "eugenesiow/bart-paraphrase"
+bart_tokenizer = BartTokenizer.from_pretrained(bart_model_name)
+bart_model = BartForConditionalGeneration.from_pretrained(bart_model_name).to(device)
+
+bart_model.eval()
+
+for p in bart_model.parameters():
+    p.requires_grad = False
+
+
+# %%
+def pegasus(txt: str) -> str:
+    with torch.inference_mode():
+        batch: dict[str, Int[torch.Tensor, "1 P"]] = pegasus_tokenizer(
+            [txt],
+            truncation=True,
+            padding="longest",
+            max_length=60,
+            return_tensors="pt",
+        )
+        translated: Int[torch.Tensor, "1 X"] = pegasus_model.generate(
+            **batch,
+            max_length=60,
+            num_beams=10,
+            num_return_sequences=1,
+            temperature=1.5
+        )
+        [out] = pegasus_tokenizer.batch_decode(translated, skip_special_tokens=True)
+        return out
+
+
+# %%
+def bart(txt: str) -> str:
+    with torch.inference_mode():
+        batch: dict[str, Int[torch.Tensor, "1 P"]] = bart_tokenizer(txt, return_tensors="pt")
+        translated: Int[torch.Tensor, "1 X"] = bart_model.generate(batch["input_ids"])
+        [out] = bart_tokenizer.batch_decode(translated, skip_special_tokens=True)
+        return out
+
+
+# %%
+eda: EDA = EDA(random_state=42)
 
 # %%
 txt_transform: RandomChoice = RandomChoice([
@@ -1415,6 +1496,9 @@ txt_transform: RandomChoice = RandomChoice([
     "An image of {}".format,
     "This is {}".format,
     "We can see {}".format,
+    eda.synonym_replacement,
+    pegasus,
+    bart,
 ])
 
 # %%
